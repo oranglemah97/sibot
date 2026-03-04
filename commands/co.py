@@ -572,31 +572,34 @@ async def co_handler(msg: Message):
     if charged_card:
         # ━━━ HIT FORMAT — Only show the charged card ━━━
         hit_card = charged_card['card']
+        sep = "━━━━━━━━━━━━━━━━━━━━"
         response = (
-            f"<blockquote><code>𝗛𝗜𝗧 𝗖𝗛𝗔𝗥𝗚𝗘𝗗 😎</code></blockquote>\n"
-            f"<blockquote><code>「 𝗦𝘁𝗿𝗶𝗽𝗲 𝗖𝗵𝗮𝗿𝗴𝗲 {price_str} 」 ✅</code></blockquote>\n\n"
-            f"<blockquote>"
-            f"「❃」 𝗣𝗿𝗼𝘅𝘆 : <code>{proxy_display}</code>\n"
-            f"「❃」 𝗠𝗲𝗿𝗰𝗵𝗮𝗻𝘁 : <code>{checkout_data['merchant'] or 'N/A'}</code>\n"
-            f"「❃」 𝗣𝗿𝗼𝗱𝘂𝗰𝘁 : <code>{checkout_data['product'] or 'N/A'}</code>"
-            f"</blockquote>\n\n"
-            f"⸙ 𝑪𝒂𝒓𝒅 ➜ <code>{hit_card}</code>\n"
-            f"⌬ 𝑺𝒕𝒂𝒕𝒖𝒔 ➜ CHARGED 😎\n"
-            f"❖ 𝑹𝒆𝒔𝒑𝒐𝒏𝒔𝒆 ➜ <code>Payment Successful</code>\n\n"
-            f"<blockquote>💲 𝗦𝘂𝗺𝗺𝗮𝗿𝘆:\n"
-            f"😎 𝗛𝗶𝘁𝘀: {charged_count}"
+            f"{sep}\n"
+            f"  <b>𝗛𝗜𝗧 𝗖𝗛𝗔𝗥𝗚𝗘𝗗</b> 😎\n"
+            f"  𝗦𝘁𝗿𝗶𝗽𝗲 𝗖𝗵𝗮𝗿𝗴𝗲 {price_str} ✅\n"
+            f"{sep}\n\n"
+            f"🌐 𝗣𝗿𝗼𝘅𝘆  ➜  {proxy_display}\n"
+            f"🏪 𝗠𝗲𝗿𝗰𝗵𝗮𝗻𝘁  ➜  {checkout_data['merchant'] or 'N/A'}\n"
+            f"📦 𝗣𝗿𝗼𝗱𝘂𝗰𝘁  ➜  {checkout_data['product'] or 'N/A'}\n\n"
+            f"💳 𝗖𝗮𝗿𝗱  ➜  <code>{hit_card}</code>\n"
+            f"📌 𝗦𝘁𝗮𝘁𝘂𝘀  ➜  CHARGED 😎\n"
+            f"📝 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲  ➜  Payment Successful\n\n"
+            f"{sep}\n"
         )
+        summary_parts = [f"😎 {charged_count}"]
         if live_count > 0:
-            response += f" | ✅ 𝗟𝗶𝘃𝗲: {live_count}"
-        response += f" | 🥲 𝗗𝗲𝗰𝗹𝗶𝗻𝗲𝘀: {declined_count}"
+            summary_parts.append(f"✅ {live_count}")
+        summary_parts.append(f"🥲 {declined_count}")
         if three_ds_count > 0:
-            response += f" | 😡 𝟯𝗗𝗦: {three_ds_count}"
+            summary_parts.append(f"😡 {three_ds_count}")
+        response += "  ".join(summary_parts)
         response += (
-            f"\n🧮 𝗧𝗼𝘁𝗮𝗹: {len(results)}/{len(cards)} | ⏱ {format_time(total_time)}\n"
-            f"\nMᴇssᴀɢᴇ Bʸ: {req_user}</blockquote>"
+            f"\n🧮 {len(results)}/{len(cards)}  ⏱ {format_time(total_time)}\n"
+            f"{sep}\n"
+            f"👤 {req_user}\n"
         )
         if checkout_data.get('success_url'):
-            response += f"\n\n<blockquote>🔗 <a href=\"{checkout_data['success_url']}\">Open Success Page</a></blockquote>"
+            response += f"\n🔗 <a href=\"{checkout_data['success_url']}\">Open Success Page</a>"
 
         # Copy button with card details
         from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CopyTextButton
@@ -640,34 +643,35 @@ async def co_handler(msg: Message):
 
     else:
         # ━━━ NO HIT — Show compact summary with reason ━━━
+        sep = "━━━━━━━━━━━━━━━━━━━━"
 
         # Determine WHY charging stopped
         session_expired = any(r['status'] == 'SESSION_EXPIRED' for r in results)
         last_result = results[-1] if results else None
 
         if cancelled:
-            header = "「 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗖𝗮𝗻𝗰𝗲𝗹𝗹𝗲𝗱 ⛔ 」"
+            header = "𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗖𝗮𝗻𝗰𝗲𝗹𝗹𝗲𝗱 ⛔"
             stop_reason = "Checkout session is no longer active"
         elif session_expired:
-            header = "「 𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗘𝘅𝗽𝗶𝗿𝗲𝗱 ⏰ 」"
+            header = "𝗦𝗲𝘀𝘀𝗶𝗼𝗻 𝗘𝘅𝗽𝗶𝗿𝗲𝗱 ⏰"
             # Get the actual error message from the expired result
             expired_result = next((r for r in results if r['status'] == 'SESSION_EXPIRED'), None)
             stop_reason = expired_result['response'] if expired_result else "Checkout session has expired"
         elif len(results) >= len(cards):
-            header = f"「 𝗡𝗼 𝗛𝗶𝘁 — {price_str} 」"
+            header = f"𝗡𝗼 𝗛𝗶𝘁 — {price_str}"
             stop_reason = "All cards processed, no successful charge"
         else:
-            header = f"「 𝗦𝘁𝗿𝗶𝗽𝗲 𝗖𝗵𝗮𝗿𝗴𝗲 {price_str} 」"
+            header = f"𝗦𝘁𝗿𝗶𝗽𝗲 𝗖𝗵𝗮𝗿𝗴𝗲 {price_str}"
             stop_reason = "Charging stopped"
 
         response = (
-            f"<blockquote><code>{header}</code></blockquote>\n\n"
-            f"<blockquote>"
-            f"「❃」 𝗣𝗿𝗼𝘅𝘆 : <code>{proxy_display}</code>\n"
-            f"「❃」 𝗠𝗲𝗿𝗰𝗵𝗮𝗻𝘁 : <code>{checkout_data['merchant'] or 'N/A'}</code>\n"
-            f"「❃」 𝗣𝗿𝗼𝗱𝘂𝗰𝘁 : <code>{checkout_data['product'] or 'N/A'}</code>\n"
-            f"「❃」 𝗦𝘁𝗮𝘁𝘂𝘀 : <code>{stop_reason}</code>"
-            f"</blockquote>\n\n"
+            f"{sep}\n"
+            f"  <b>{header}</b>\n"
+            f"{sep}\n\n"
+            f"🌐 𝗣𝗿𝗼𝘅𝘆  ➜  {proxy_display}\n"
+            f"🏪 𝗠𝗲𝗿𝗰𝗵𝗮𝗻𝘁  ➜  {checkout_data['merchant'] or 'N/A'}\n"
+            f"📦 𝗣𝗿𝗼𝗱𝘂𝗰𝘁  ➜  {checkout_data['product'] or 'N/A'}\n"
+            f"⚠️ 𝗦𝘁𝗮𝘁𝘂𝘀  ➜  {stop_reason}\n\n"
         )
 
         # Show LIVE cards if any
@@ -675,26 +679,29 @@ async def co_handler(msg: Message):
         if live_cards:
             for r in live_cards[:5]:
                 response += (
-                    f"⸙ 𝑪𝒂𝒓𝒅 ➜ <code>{r['card']}</code>\n"
-                    f"⌬ 𝑺𝒕𝒂𝒕𝒖𝒔 ➜ LIVE ✅\n"
-                    f"❖ 𝑹𝒆𝒔𝒑𝒐𝒏𝒔𝒆 ➜ <code>{r['response']}</code>\n"
+                    f"💳 𝗖𝗮𝗿𝗱  ➜  <code>{r['card']}</code>\n"
+                    f"📌 𝗦𝘁𝗮𝘁𝘂𝘀  ➜  LIVE ✅\n"
+                    f"📝 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲  ➜  {r['response']}\n"
                     f"{CARD_SEPARATOR}\n"
                 )
             if len(live_cards) > 5:
                 response += f"       ⋯ {len(live_cards) - 5} more LIVE cards ⋯\n\n"
 
         # Summary
-        response += f"<blockquote>💲 𝗦𝘂𝗺𝗺𝗮𝗿𝘆:\n"
+        response += f"{sep}\n"
+        summary_parts = []
         if live_count > 0:
-            response += f"✅ 𝗟𝗶𝘃𝗲: {live_count} | "
-        response += f"🥲 𝗗𝗲𝗰𝗹𝗶𝗻𝗲𝘀: {declined_count}"
+            summary_parts.append(f"✅ {live_count}")
+        summary_parts.append(f"🥲 {declined_count}")
         if three_ds_count > 0:
-            response += f" | 😡 𝟯𝗗𝗦: {three_ds_count}"
+            summary_parts.append(f"😡 {three_ds_count}")
         if error_count > 0:
-            response += f" | 💀 𝗘𝗿𝗿𝗼𝗿𝘀: {error_count}"
+            summary_parts.append(f"💀 {error_count}")
+        response += "  ".join(summary_parts)
         response += (
-            f"\n🧮 𝗧𝗼𝘁𝗮𝗹: {len(results)}/{len(cards)} | ⏱ {format_time(total_time)}\n"
-            f"\nMᴇssᴀɢᴇ Bʸ: {req_user}</blockquote>"
+            f"\n🧮 {len(results)}/{len(cards)}  ⏱ {format_time(total_time)}\n"
+            f"{sep}\n"
+            f"👤 {req_user}"
         )
 
         await processing_msg.edit_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)

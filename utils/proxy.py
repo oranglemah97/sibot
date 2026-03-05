@@ -144,36 +144,16 @@ def remove_global_proxy(proxy: str = None):
     return False
 
 
-# Per-user proxy rotation state: {user_id: {"proxy": str, "count": int, "index": int}}
-_proxy_rotation = {}
-
-
 def get_user_proxy(user_id: int) -> str:
-    """Get the current proxy for a user with rotation every 10 attempts."""
+    """Get a random proxy for a user (random per attempt)."""
     user_proxies = get_user_proxies(user_id)
     global_proxies = get_global_proxies()
     all_proxies = user_proxies + global_proxies
     if not all_proxies:
         return None
 
-    user_key = str(user_id)
+    return random.choice(all_proxies)
 
-    if user_key not in _proxy_rotation:
-        _proxy_rotation[user_key] = {"proxy": all_proxies[0], "count": 0, "index": 0}
-
-    state = _proxy_rotation[user_key]
-
-    if state["proxy"] not in all_proxies:
-        state["index"] = 0
-        state["proxy"] = all_proxies[0]
-        state["count"] = 0
-
-    if state["count"] >= 10:
-        state["proxy"] = random.choice(all_proxies)
-        state["count"] = 0
-
-    state["count"] += 1
-    return state["proxy"]
 
 
 def obfuscate_ip(ip: str) -> str:

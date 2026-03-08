@@ -21,6 +21,7 @@ from utils.proxy import (
     get_user_proxies, add_user_proxy, remove_user_proxy,
     get_global_proxies, add_global_proxy, remove_global_proxy,
     get_user_proxy, get_proxy_info, check_proxies_batch,
+    get_proxy_url,
 )
 from utils.ratelimit import check_rate_limit, get_cooldown_seconds, MAX_CARDS_PER_COMMAND
 from utils.stripe import generate_session_context, warm_checkout_session, send_m_stripe_beacon
@@ -475,7 +476,8 @@ async def co_handler(msg: Message):
 
     # Create session context FIRST — same TLS/fingerprints for init AND confirm
     session_ctx = generate_session_context(user_id)
-    init_proxy = get_user_proxy(user_id)
+    init_proxy_raw = get_user_proxy(user_id)
+    init_proxy = get_proxy_url(init_proxy_raw) if init_proxy_raw else None
     print(f"[DEBUG] Session: TLS={session_ctx['tls_profile']}, guid={session_ctx['fingerprints']['guid'][:8]}...")
     print(f"[DEBUG] Using SAME proxy for init + confirm: {'YES' if init_proxy else 'DIRECT'}")
 

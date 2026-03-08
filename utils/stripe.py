@@ -2,6 +2,9 @@ import re
 import random
 import string
 import uuid
+import asyncio
+
+from curl_cffi.requests import AsyncSession as CurlSession
 
 from utils.constants import USER_AGENTS, TLS_PROFILES, get_random_browser_profile
 
@@ -113,85 +116,140 @@ def get_headers(stripe_js: bool = False) -> dict:
 
 import hashlib
 import aiohttp
+import time as _time
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  Real Stripe.js hash scraping from CDN
+#  Auto-refreshes every 3 hours (TTL)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+_STRIPE_HASH_TTL = 3 * 60 * 60  # 3 jam dalam detik
+
 _cached_stripe_hashes = {
     "core": None,     # stripe.js main bundle hash
     "v3": None,       # stripe-js-v3 module hash
-    "fetched": False, # whether we've attempted fetch
+    "fetched_at": 0,  # timestamp terakhir fetch (epoch seconds)
 }
+_stripe_hash_lock = None  # asyncio.Lock, lazy init
 
 
-async def fetch_stripe_js_hashes():
+def _is_hash_stale() -> bool:
+    """Check apakah hash sudah expired (lebih dari 3 jam)."""
+    if not _cached_stripe_hashes["core"]:
+        return True  # Belum pernah fetch
+    elapsed = _time.time() - _cached_stripe_hashes["fetched_at"]
+    return elapsed >= _STRIPE_HASH_TTL
+
+
+async def _get_hash_lock():
+    """Lazy init asyncio.Lock (harus di dalam event loop)."""
+    global _stripe_hash_lock
+    if _stripe_hash_lock is None:
+        _stripe_hash_lock = asyncio.Lock()
+    return _stripe_hash_lock
+
+
+async def fetch_stripe_js_hashes(force: bool = False):
     """Fetch real Stripe.js from CDN and extract build hashes.
     
-    Should be called once at bot startup. Extracts fingerprint hashes
-    from the webpack bundle's 'fingerprinted/js/' asset paths, which
-    are the same hashes Stripe uses to identify legitimate JS clients.
+    Auto-refreshes setiap 3 jam. Bisa dipanggil berkali-kali — 
+    hanya fetch ulang jika TTL expired atau force=True.
+    
+    Extracts fingerprint hashes from the webpack bundle's 
+    'fingerprinted/js/' asset paths, which are the same hashes 
+    Stripe uses to identify legitimate JS clients.
     """
     global _cached_stripe_hashes
     
-    if _cached_stripe_hashes["fetched"]:
+    # Skip jika hash masih fresh (belum expired)
+    if not force and not _is_hash_stale():
         return
     
-    _cached_stripe_hashes["fetched"] = True
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://js.stripe.com/v3/",
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                    "Accept": "*/*",
-                },
-                timeout=aiohttp.ClientTimeout(total=15),
-                ssl=False,
-            ) as resp:
-                if resp.status != 200:
-                    print(f"[DEBUG] Stripe.js fetch failed: HTTP {resp.status}")
-                    return
-                
-                content = await resp.text()
-                
-                # Extract fingerprint hashes from the webpack bundle
-                # Real Stripe.js contains paths like: fingerprinted/js/MODULE-HASH.js
-                js_hashes = re.findall(
-                    r'fingerprinted/js/[a-zA-Z0-9_-]+-([a-f0-9]{20,40})\.js',
-                    content
-                )
-                
-                if js_hashes:
-                    # Use first two distinct hashes for core and v3
-                    unique_hashes = list(dict.fromkeys(js_hashes))
-                    _cached_stripe_hashes["core"] = unique_hashes[0][:10]
-                    if len(unique_hashes) > 1:
-                        _cached_stripe_hashes["v3"] = unique_hashes[1][:10]
+    # Prevent concurrent fetches
+    lock = await _get_hash_lock()
+    async with lock:
+        # Double-check setelah acquire lock
+        if not force and not _is_hash_stale():
+            return
+        
+        old_core = _cached_stripe_hashes.get("core")
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://js.stripe.com/v3/",
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                        "Accept": "*/*",
+                    },
+                    timeout=aiohttp.ClientTimeout(total=15),
+                    ssl=False,
+                ) as resp:
+                    if resp.status != 200:
+                        print(f"[DEBUG] Stripe.js fetch failed: HTTP {resp.status}")
+                        # Jangan reset fetched_at agar retry lagi nanti
+                        return
+                    
+                    content = await resp.text()
+                    
+                    # Extract fingerprint hashes from the webpack bundle
+                    # Real Stripe.js contains paths like: fingerprinted/js/MODULE-HASH.js
+                    js_hashes = re.findall(
+                        r'fingerprinted/js/[a-zA-Z0-9_-]+-([a-f0-9]{20,40})\.js',
+                        content
+                    )
+                    
+                    if js_hashes:
+                        # Use first two distinct hashes for core and v3
+                        unique_hashes = list(dict.fromkeys(js_hashes))
+                        _cached_stripe_hashes["core"] = unique_hashes[0][:10]
+                        if len(unique_hashes) > 1:
+                            _cached_stripe_hashes["v3"] = unique_hashes[1][:10]
+                        else:
+                            _cached_stripe_hashes["v3"] = unique_hashes[0][:10]
+                        _cached_stripe_hashes["fetched_at"] = _time.time()
+                        
+                        changed = old_core != _cached_stripe_hashes["core"]
+                        status = "🔄 UPDATED" if (old_core and changed) else "✅ Fetched"
+                        print(f"[DEBUG] {status} Stripe.js hashes: "
+                              f"core={_cached_stripe_hashes['core']}, "
+                              f"v3={_cached_stripe_hashes['v3']} "
+                              f"(from {len(unique_hashes)} unique hashes, "
+                              f"TTL={_STRIPE_HASH_TTL//3600}h)")
                     else:
-                        _cached_stripe_hashes["v3"] = unique_hashes[0][:10]
-                    
-                    print(f"[DEBUG] ✅ Stripe.js real hashes scraped: "
-                          f"core={_cached_stripe_hashes['core']}, "
-                          f"v3={_cached_stripe_hashes['v3']} "
-                          f"(from {len(unique_hashes)} unique hashes)")
-                else:
-                    # Fallback: derive hash from content itself
-                    content_hash = hashlib.sha256(content.encode()).hexdigest()
-                    _cached_stripe_hashes["core"] = content_hash[:10]
-                    _cached_stripe_hashes["v3"] = content_hash[10:20]
-                    print(f"[DEBUG] ⚠️ No fingerprint paths found, using content hash: "
-                          f"core={_cached_stripe_hashes['core']}, "
-                          f"v3={_cached_stripe_hashes['v3']}")
-                    
-    except Exception as e:
-        print(f"[DEBUG] ❌ Stripe.js hash fetch error: {str(e)[:80]}")
+                        # Fallback: derive hash from content itself
+                        content_hash = hashlib.sha256(content.encode()).hexdigest()
+                        _cached_stripe_hashes["core"] = content_hash[:10]
+                        _cached_stripe_hashes["v3"] = content_hash[10:20]
+                        _cached_stripe_hashes["fetched_at"] = _time.time()
+                        print(f"[DEBUG] ⚠️ No fingerprint paths found, using content hash: "
+                              f"core={_cached_stripe_hashes['core']}, "
+                              f"v3={_cached_stripe_hashes['v3']}")
+                        
+        except Exception as e:
+            print(f"[DEBUG] ❌ Stripe.js hash fetch error: {str(e)[:80]}")
+            # Jika sudah punya hash lama, tetap pakai — jangan kosongkan
+            # Hanya set fetched_at mundur sedikit agar retry lebih cepat (30 menit)
+            if _cached_stripe_hashes["core"]:
+                _cached_stripe_hashes["fetched_at"] = _time.time() - _STRIPE_HASH_TTL + 1800
+                print(f"[DEBUG] ⚠️ Keeping old hashes, retry in ~30min")
 
 
 def get_random_stripe_js_agent() -> str:
-    """Get Stripe.js payment_user_agent using real CDN hashes when available."""
+    """Get Stripe.js payment_user_agent using real CDN hashes when available.
+    
+    Jika hash sudah stale, akan trigger background refresh pada call berikutnya.
+    """
     core = _cached_stripe_hashes.get("core")
     v3 = _cached_stripe_hashes.get("v3")
+    
+    # Schedule background refresh jika stale (non-blocking)
+    if _is_hash_stale():
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(fetch_stripe_js_hashes())
+            print(f"[DEBUG] 🔄 Stripe.js hash refresh scheduled (TTL expired)")
+        except RuntimeError:
+            pass  # No event loop — will be refreshed on next async call
     
     if not core or not v3:
         # Last resort fallback — should rarely happen if fetch_stripe_js_hashes() was called
@@ -235,9 +293,260 @@ def generate_eid() -> str:
     return str(uuid.uuid4())
 
 
-def get_stripe_cookies(fp: dict) -> str:
-    """Generate Stripe cookie header mimicking real browser."""
-    return f"__stripe_mid={fp['muid']}; __stripe_sid={fp['sid']}"
+def get_stripe_cookies(fp: dict, real_cookies: dict = None) -> str:
+    """Generate Stripe cookie header — uses real cookies from warm session if available."""
+    mid = real_cookies.get("__stripe_mid", fp['muid']) if real_cookies else fp['muid']
+    sid = real_cookies.get("__stripe_sid", fp['sid']) if real_cookies else fp['sid']
+    
+    cookie_str = f"__stripe_mid={mid}; __stripe_sid={sid}"
+    
+    # Include any extra cookies from warm session
+    if real_cookies:
+        for k, v in real_cookies.items():
+            if k not in ("__stripe_mid", "__stripe_sid"):
+                cookie_str += f"; {k}={v}"
+    
+    return cookie_str
+
+
+async def warm_checkout_session(checkout_url: str, tls_profile: str, user_agent: str, proxy: str = None) -> dict:
+    """Fetch checkout page to collect real Stripe cookies and establish session.
+    
+    Real browsers always load the checkout page first before making API calls.
+    This step gets real __stripe_mid/__stripe_sid cookies from Stripe's servers.
+    
+    Returns dict with:
+        - cookies: dict of cookie name -> value from Set-Cookie headers
+        - success: whether the page was loaded successfully
+    """
+    result = {"cookies": {}, "success": False}
+    
+    try:
+        async with CurlSession(impersonate=tls_profile) as s:
+            r = await s.get(
+                checkout_url,
+                headers={
+                    "user-agent": user_agent,
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                    "accept-language": "en-US,en;q=0.9",
+                    "sec-fetch-dest": "document",
+                    "sec-fetch-mode": "navigate",
+                    "sec-fetch-site": "none",
+                    "sec-fetch-user": "?1",
+                    "upgrade-insecure-requests": "1",
+                },
+                timeout=15,
+                allow_redirects=True,
+                proxy=proxy,
+            )
+            
+            # Debug: show raw Set-Cookie headers
+            print(f"[DEBUG] Warm response status: {r.status_code}")
+            try:
+                all_headers = dict(r.headers) if hasattr(r.headers, '__iter__') else {}
+                set_cookie_raw = [v for k, v in all_headers.items() if k.lower() == 'set-cookie']
+                print(f"[DEBUG] Raw Set-Cookie: {set_cookie_raw[:3]}")
+            except Exception:
+                pass
+            
+            # Strategy 1: Extract from cookies jar
+            try:
+                if hasattr(r, 'cookies') and r.cookies:
+                    for name in r.cookies.keys():
+                        result["cookies"][name] = r.cookies.get(name, "")
+            except Exception:
+                pass
+            
+            # Strategy 2: Extract from session cookies
+            try:
+                if hasattr(s, 'cookies') and s.cookies:
+                    for name in s.cookies.keys():
+                        result["cookies"][name] = s.cookies.get(name, "")
+            except Exception:
+                pass
+            
+            # Strategy 3: Parse Set-Cookie from raw headers
+            try:
+                raw_headers = str(r.headers) if hasattr(r, 'headers') else ""
+                # curl_cffi headers — try multiple methods
+                if hasattr(r.headers, 'multi_items'):
+                    for name, value in r.headers.multi_items():
+                        if name.lower() == "set-cookie":
+                            parts = value.split(";")[0].strip()
+                            if "=" in parts:
+                                k, v = parts.split("=", 1)
+                                result["cookies"][k.strip()] = v.strip()
+                elif hasattr(r.headers, 'items'):
+                    for name, value in r.headers.items():
+                        if name.lower() == "set-cookie":
+                            parts = value.split(";")[0].strip()
+                            if "=" in parts:
+                                k, v = parts.split("=", 1)
+                                result["cookies"][k.strip()] = v.strip()
+            except Exception:
+                pass
+            
+            # Strategy 4: Look for stripe cookies in response body (JS sets them)
+            if not result["cookies"] and r.status_code == 200:
+                try:
+                    body = r.text
+                    import re
+                    # Find __stripe_mid and __stripe_sid in the HTML/JS
+                    for cookie_name in ["__stripe_mid", "__stripe_sid"]:
+                        match = re.search(rf'{cookie_name}["\s]*[=:]["\s]*([a-f0-9-]+)', body)
+                        if match:
+                            result["cookies"][cookie_name] = match.group(1)
+                except Exception:
+                    pass
+            
+            if r.status_code == 200:
+                result["success"] = True
+                print(f"[DEBUG] ✅ Warm session OK — got {len(result['cookies'])} cookies: {list(result['cookies'].keys())}")
+            else:
+                print(f"[DEBUG] ⚠️ Warm session HTTP {r.status_code}")
+                result["success"] = True  # Still usable
+                
+    except Exception as e:
+        print(f"[DEBUG] ❌ Warm session error: {str(e)[:60]}")
+    
+    return result
+
+
+async def send_m_stripe_beacon(fp: dict, checkout_url: str, tls_profile: str, user_agent: str, cookies_str: str, proxy: str = None) -> bool:
+    """Send multiple telemetry beacons to m.stripe.com/6 like real Stripe.js.
+    
+    Real Stripe.js sends 5+ beacons throughout page lifecycle.
+    """
+    import json
+    import time
+    
+    beacon_headers = {
+        "user-agent": user_agent,
+        "content-type": "application/json",
+        "origin": "https://checkout.stripe.com",
+        "referer": "https://checkout.stripe.com/",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-site",
+        "cookie": cookies_str,
+    }
+    
+    now = int(time.time() * 1000)
+    
+    # Multiple beacons matching real Stripe.js lifecycle
+    beacons = [
+        {
+            "v": 2,
+            "tag": "checkout_init_pageload",
+            "src": "checkout-js",
+            "pid": fp["guid"],
+            "data": {
+                "url": checkout_url,
+                "muid": fp["muid"],
+                "sid": fp["sid"],
+                "pageloadTimestamp": now,
+                "livemode": True,
+                "userAgent": user_agent,
+            }
+        },
+        {
+            "v": 2,
+            "tag": "checkout_init_loaded",
+            "src": "checkout-js",
+            "pid": fp["guid"],
+            "data": {
+                "url": checkout_url,
+                "muid": fp["muid"],
+                "sid": fp["sid"],
+                "loadTimestamp": now + random.randint(800, 2000),
+                "livemode": True,
+            }
+        },
+        {
+            "v": 2,
+            "tag": "payment_element_loaded",
+            "src": "checkout-js",
+            "pid": fp["guid"],
+            "data": {
+                "url": checkout_url,
+                "muid": fp["muid"],
+                "sid": fp["sid"],
+                "elementTimestamp": now + random.randint(2000, 4000),
+                "livemode": True,
+                "type": "card",
+            }
+        },
+        {
+            "v": 2,
+            "tag": "checkout_contact_info_rendered",
+            "src": "checkout-js",
+            "pid": fp["guid"],
+            "data": {
+                "url": checkout_url,
+                "muid": fp["muid"],
+                "sid": fp["sid"],
+                "renderTimestamp": now + random.randint(2500, 4500),
+                "livemode": True,
+                "hasEmail": True,
+            }
+        },
+        {
+            "v": 2,
+            "tag": "checkout_payment_form_interacted",
+            "src": "checkout-js",
+            "pid": fp["guid"],
+            "data": {
+                "url": checkout_url,
+                "muid": fp["muid"],
+                "sid": fp["sid"],
+                "interactionTimestamp": now + random.randint(4000, 7000),
+                "livemode": True,
+                "fieldType": "cardNumber",
+            }
+        },
+    ]
+    
+    sent = 0
+    collected_cookies = {}
+    try:
+        async with CurlSession(impersonate=tls_profile) as s:
+            for beacon in beacons:
+                try:
+                    r = await s.post(
+                        "https://m.stripe.com/6",
+                        headers=beacon_headers,
+                        data=json.dumps(beacon),
+                        timeout=8,
+                        proxy=proxy,
+                    )
+                    sent += 1
+                    # Extract cookies from beacon response
+                    try:
+                        if hasattr(r, 'cookies') and r.cookies:
+                            for name in r.cookies.keys():
+                                collected_cookies[name] = r.cookies.get(name, "")
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                await asyncio.sleep(random.uniform(0.1, 0.3))
+            
+            # Also check session cookies
+            try:
+                if hasattr(s, 'cookies') and s.cookies:
+                    for name in s.cookies.keys():
+                        collected_cookies[name] = s.cookies.get(name, "")
+            except Exception:
+                pass
+        
+        if collected_cookies:
+            print(f"[DEBUG] ✅ Beacon cookies: {list(collected_cookies.keys())}")
+        print(f"[DEBUG] ✅ m.stripe.com beacons sent: {sent}/{len(beacons)}")
+        return sent > 0, collected_cookies
+            
+    except Exception as e:
+        print(f"[DEBUG] ⚠️ Beacon error (non-fatal): {str(e)[:50]}")
+        return False, {}
 
 
 def generate_session_context(user_id: int = None) -> dict:

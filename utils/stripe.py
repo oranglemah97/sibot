@@ -9,8 +9,7 @@ from curl_cffi.requests import AsyncSession as CurlSession
 from utils.constants import USER_AGENTS, TLS_PROFILES, get_random_browser_profile
 
 
-# Per-user persistent fingerprints (muid stays same per machine)
-_user_fingerprints = {}
+# Fingerprints are now generated fresh per attempt (rotation)
 
 
 def _detect_browser_info(ua: str) -> dict:
@@ -50,11 +49,33 @@ def _detect_browser_info(ua: str) -> dict:
     return info
 
 
-def get_stripe_headers() -> dict:
-    """Minimal Stripe-specific headers for use with curl_cffi impersonate.
-    Browser headers (UA, sec-ch-ua, etc) are auto-set by curl_cffi."""
-    return {
+def _get_grease_brand(major: str) -> tuple:
+    """Get deterministic GREASE brand based on Chrome major version.
+    Real Chrome picks GREASE brand deterministically, not randomly."""
+    grease_options = [
+        ("Not_A Brand", "8"),
+        ("Not A(Brand", "99"),
+        ("Not)A;Brand", "99"),
+        ("Not/A)Brand", "8"),
+    ]
+    idx = int(major) % len(grease_options)
+    return grease_options[idx]
+
+
+def get_stripe_headers(user_agent: str = None) -> dict:
+    """Stripe-specific headers for use with curl_cffi impersonate.
+    When user_agent is provided, sets correct sec-ch-ua headers
+    (critical for Edge/Opera where curl_cffi defaults don't match UA)."""
+    headers = {
         "accept": "application/json",
+        "accept-language": random.choice([
+            "en-US,en;q=0.9",
+            "en-US,en;q=0.9,id;q=0.8",
+            "en-GB,en;q=0.9,en-US;q=0.8",
+            "en-US,en;q=0.9,nl;q=0.8",
+            "en-US,en;q=0.9,de;q=0.8",
+            "en-US,en;q=0.9,fr;q=0.8",
+        ]),
         "content-type": "application/x-www-form-urlencoded",
         "origin": "https://checkout.stripe.com",
         "referer": "https://checkout.stripe.com/",
@@ -62,6 +83,22 @@ def get_stripe_headers() -> dict:
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-site",
     }
+    if user_agent:
+        headers["user-agent"] = user_agent
+        browser = _detect_browser_info(user_agent)
+        v = browser["version"]
+        platform = browser["platform"]
+        if browser["browser"] in ("Chrome", "Edge", "Opera"):
+            g_brand, g_ver = _get_grease_brand(v)
+            if browser["browser"] == "Edge":
+                headers["sec-ch-ua"] = f'"Chromium";v="{v}", "{g_brand}";v="{g_ver}", "Microsoft Edge";v="{v}"'
+            elif browser["browser"] == "Opera":
+                headers["sec-ch-ua"] = f'"Chromium";v="{v}", "{g_brand}";v="{g_ver}", "Opera";v="{v}"'
+            else:
+                headers["sec-ch-ua"] = f'"Chromium";v="{v}", "{g_brand}";v="{g_ver}", "Google Chrome";v="{v}"'
+            headers["sec-ch-ua-mobile"] = "?0"
+            headers["sec-ch-ua-platform"] = f'"{platform}"'
+    return headers
 
 
 def get_headers(stripe_js: bool = False) -> dict:
@@ -92,22 +129,15 @@ def get_headers(stripe_js: bool = False) -> dict:
         headers["sec-fetch-mode"] = "cors"
         headers["sec-fetch-site"] = "same-site"
 
-        # Dynamic sec-ch-ua based on actual browser
+        # Dynamic sec-ch-ua based on actual browser (deterministic GREASE brand)
         if browser["browser"] in ("Chrome", "Edge", "Opera"):
-            not_a_brands = [
-                '"Not(A:Brand";v="24"',
-                '"Not_A Brand";v="8"',
-                '"Not/A)Brand";v="8"',
-                '"Not A(Brand";v="99"',
-                '"Not)A;Brand";v="99"',
-            ]
-            not_a = random.choice(not_a_brands)
+            g_brand, g_ver = _get_grease_brand(v)
             if browser["browser"] == "Edge":
-                headers["sec-ch-ua"] = f'"Chromium";v="{v}", {not_a}, "Microsoft Edge";v="{v}"'
+                headers["sec-ch-ua"] = f'"Chromium";v="{v}", "{g_brand}";v="{g_ver}", "Microsoft Edge";v="{v}"'
             elif browser["browser"] == "Opera":
-                headers["sec-ch-ua"] = f'"Chromium";v="{v}", {not_a}, "Opera";v="{v}"'
+                headers["sec-ch-ua"] = f'"Chromium";v="{v}", "{g_brand}";v="{g_ver}", "Opera";v="{v}"'
             else:
-                headers["sec-ch-ua"] = f'"Chromium";v="{v}", {not_a}, "Google Chrome";v="{v}"'
+                headers["sec-ch-ua"] = f'"Chromium";v="{v}", "{g_brand}";v="{g_ver}", "Google Chrome";v="{v}"'
             headers["sec-ch-ua-mobile"] = "?0"
             headers["sec-ch-ua-platform"] = f'"{platform}"'
         # Firefox/Safari don't send sec-ch-ua
@@ -115,8 +145,40 @@ def get_headers(stripe_js: bool = False) -> dict:
     return headers
 
 import hashlib
+import json as _json
 import aiohttp
 import time as _time
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  X-Stripe-Telemetry tracking
+#  Real Stripe.js sends this on every request after the first
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+_last_request_metrics = {}
+
+
+def record_stripe_request(request_id: str, duration_ms: int):
+    """Record metrics from a Stripe API response for telemetry header.
+    
+    Call this after every Stripe API request with:
+    - request_id: from response header 'Request-Id' (e.g. 'req_xxx')
+    - duration_ms: how long the request took in ms
+    """
+    global _last_request_metrics
+    _last_request_metrics = {
+        "request_id": request_id,
+        "request_duration_ms": duration_ms,
+    }
+
+
+def get_stripe_telemetry_header() -> str | None:
+    """Get X-Stripe-Telemetry header value if we have previous request metrics.
+    
+    Returns None on first request (real Stripe.js doesn't send it on first request).
+    """
+    if not _last_request_metrics:
+        return None
+    return _json.dumps({"last_request_metrics": _last_request_metrics})
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  Real Stripe.js hash scraping from CDN
@@ -269,28 +331,233 @@ def _uuid_format() -> str:
 
 
 def generate_stripe_fingerprints(user_id: int = None) -> dict:
-    """Generate Stripe.js fingerprint identifiers.
-    muid is persistent per user (like browser cookies).
-    guid is per-page-load. sid is per-session."""
-
-    # muid persistent per user (simulates __stripe_mid cookie)
-    if user_id and user_id in _user_fingerprints:
-        muid = _user_fingerprints[user_id]
-    else:
-        muid = _uuid_format()
-        if user_id:
-            _user_fingerprints[user_id] = muid
-
-    # guid = per page load, sid = per session
+    """Generate fresh Stripe.js fingerprint identifiers per attempt.
+    muid, guid, sid are all freshly generated for rotation."""
+    muid = _uuid_format()
     guid = _uuid_format()
     sid = _uuid_format()
-
     return {"muid": muid, "guid": guid, "sid": sid}
 
 
 def generate_eid() -> str:
     """Generate a valid UUID v4 for the eid parameter."""
     return str(uuid.uuid4())
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  Canvas/WebGL Device Fingerprint
+#  Simulates what Stripe Radar collects from real browsers
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Real GPU renderers seen on common hardware
+_WEBGL_RENDERERS = [
+    {"vendor": "Google Inc. (NVIDIA)", "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+    {"vendor": "Google Inc. (NVIDIA)", "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3070 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+    {"vendor": "Google Inc. (NVIDIA)", "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+    {"vendor": "Google Inc. (NVIDIA)", "renderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+    {"vendor": "Google Inc. (NVIDIA)", "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 2060 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+    {"vendor": "Google Inc. (AMD)", "renderer": "ANGLE (AMD, AMD Radeon RX 580 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+    {"vendor": "Google Inc. (AMD)", "renderer": "ANGLE (AMD, AMD Radeon RX 6700 XT Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+    {"vendor": "Google Inc. (AMD)", "renderer": "ANGLE (AMD, AMD Radeon RX 7800 XT Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+    {"vendor": "Google Inc. (Intel)", "renderer": "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+    {"vendor": "Google Inc. (Intel)", "renderer": "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+    {"vendor": "Google Inc. (Intel)", "renderer": "ANGLE (Intel, Intel(R) UHD Graphics 770 Direct3D11 vs_5_0 ps_5_0, D3D11)"},
+    # macOS renderers
+    {"vendor": "Google Inc. (Apple)", "renderer": "ANGLE (Apple, Apple M1, OpenGL 4.1)"},
+    {"vendor": "Google Inc. (Apple)", "renderer": "ANGLE (Apple, Apple M2, OpenGL 4.1)"},
+    {"vendor": "Google Inc. (Apple)", "renderer": "ANGLE (Apple, Apple M3, OpenGL 4.1)"},
+    {"vendor": "Google Inc. (Apple)", "renderer": "ANGLE (Apple, Apple M1 Pro, OpenGL 4.1)"},
+    # Linux renderers (Mesa/OpenGL 4.5 — D3D11 is Windows-only)
+    {"vendor": "Google Inc. (Intel)", "renderer": "ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.5)"},
+    {"vendor": "Google Inc. (NVIDIA)", "renderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 1650/PCIe/SSE2, OpenGL 4.5)"},
+    {"vendor": "Google Inc. (NVIDIA)", "renderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060/PCIe/SSE2, OpenGL 4.5)"},
+    {"vendor": "Google Inc. (AMD)", "renderer": "ANGLE (AMD, AMD Radeon RX 580, OpenGL 4.5)"},
+]
+
+_SCREEN_RESOLUTIONS = [
+    {"w": 1920, "h": 1080, "avail_w": 1920, "avail_h": 1040, "dpr": 1},
+    {"w": 2560, "h": 1440, "avail_w": 2560, "avail_h": 1400, "dpr": 1},
+    {"w": 1920, "h": 1080, "avail_w": 1920, "avail_h": 1032, "dpr": 1.25},
+    {"w": 1536, "h": 864, "avail_w": 1536, "avail_h": 824, "dpr": 1.25},
+    {"w": 3840, "h": 2160, "avail_w": 3840, "avail_h": 2120, "dpr": 1.5},
+    {"w": 1440, "h": 900, "avail_w": 1440, "avail_h": 875, "dpr": 2},   # MacBook
+    {"w": 2560, "h": 1600, "avail_w": 2560, "avail_h": 1575, "dpr": 2},  # MacBook Pro
+    {"w": 1680, "h": 1050, "avail_w": 1680, "avail_h": 1025, "dpr": 2},  # iMac
+]
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  Device Fingerprint - Rotation per Attempt
+#  Hanya metode yang diperlukan:
+#  - Navigator (UA, Platform, Hardware Concurrency, Device Memory, Language)
+#  - User-Agent Data (Client Hints: brands, platformVersion, architecture)
+#  - Canvas (Position-based deterministic noise)
+#  - WebGL (GPU vendor/renderer - Intel/NVIDIA/AMD)
+#  - AudioContext (Imperceptible noise ~-80dB)
+#  - Screen (Resolution, colorDepth, pixelRatio)
+#  - Plugins/MimeTypes (PDF viewer consistency)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# AudioContext noise generator - imperceptible ~-80dB
+def _generate_audio_noise() -> float:
+    """Generate imperceptible audio noise (~-80dB) for AudioContext fingerprint."""
+    # -80dB = 10^(-80/20) = 0.0001
+    base_noise = 0.0001
+    # Add small variation ±20%
+    variation = random.uniform(0.8, 1.2)
+    return base_noise * variation
+
+
+def _generate_canvas_noise() -> str:
+    """Generate deterministic position-based canvas noise."""
+    # Position-based noise: slight pixel offsets that are deterministic per session
+    offset_x = random.randint(-2, 2)
+    offset_y = random.randint(-2, 2)
+    return hashlib.sha256(f"canvas-{offset_x}-{offset_y}".encode()).hexdigest()[:32]
+
+
+def _get_pdf_viewer_consistency() -> dict:
+    """Generate consistent PDF plugin/MIME type data."""
+    # Real browsers have consistent PDF viewer settings
+    return {
+        "has_pdf_viewer": True,
+        "pdf_mime_type": "application/pdf",
+        "pdf_plugin_enabled": random.choice([True, True, True, False]),  # 75% enabled
+    }
+
+
+def _get_client_hints(ua: str, platform: str) -> dict:
+    """Generate User-Agent Client Hints (brands, platformVersion, architecture)."""
+    browser = _detect_browser_info(ua)
+    v = browser["version"]
+    
+    # Determine architecture based on platform
+    if platform == "Win32":
+        architecture = "x86"
+        arch_bitness = "64"
+        platform_version = "15.0.0"  # Windows 11
+    elif platform == "MacIntel":
+        architecture = "arm" if "Apple" in ua and random.random() > 0.3 else "x86"
+        arch_bitness = "64"
+        platform_version = "14.0.0"  # macOS Sonoma
+    else:  # Linux
+        architecture = "x86"
+        arch_bitness = "64"
+        platform_version = "6.8.0"  # Linux kernel version
+    
+    # GREASE brand handling
+    g_brand, g_ver = _get_grease_brand(v)
+    
+    if browser["browser"] == "Edge":
+        brands = [
+            {"brand": "Chromium", "version": v},
+            {"brand": g_brand, "version": g_ver},
+            {"brand": "Microsoft Edge", "version": v}
+        ]
+    elif browser["browser"] == "Opera":
+        brands = [
+            {"brand": "Chromium", "version": v},
+            {"brand": g_brand, "version": g_ver},
+            {"brand": "Opera", "version": v}
+        ]
+    elif browser["browser"] == "Firefox":
+        # Firefox doesn't send brands
+        brands = []
+    elif browser["browser"] == "Safari":
+        # Safari sends limited brands
+        brands = [{"brand": "Safari", "version": v}]
+    else:  # Chrome
+        brands = [
+            {"brand": "Chromium", "version": v},
+            {"brand": g_brand, "version": g_ver},
+            {"brand": "Google Chrome", "version": v}
+        ]
+    
+    return {
+        "brands": brands,
+        "platform_version": platform_version,
+        "architecture": architecture,
+        "arch_bitness": arch_bitness,
+        "model": "",  # Empty for desktop
+        "mobile": False,
+    }
+
+
+def generate_device_fingerprint(user_agent: str, user_id: int = None) -> dict:
+    """Generate a fresh device fingerprint per attempt (rotation).
+    
+    Setiap panggilan menghasilkan fingerprint baru - tidak ada caching per user.
+    Hanya menyimpan metode fingerprinting yang diperlukan:
+    - Navigator: UA, Platform, Hardware Concurrency, Device Memory, Language
+    - User-Agent Data: Client Hints API (brands, platformVersion, architecture)
+    - Canvas: Position-based deterministic noise
+    - WebGL: GPU vendor/renderer (Intel/NVIDIA/AMD)
+    - AudioContext: Imperceptible noise (~-80dB)
+    - Screen: Resolution, colorDepth, pixelRatio
+    - Plugins/MimeTypes: PDF viewer consistency
+    """
+    # Pick GPU renderer based on UA platform
+    is_mac = "Macintosh" in user_agent or "Mac OS X" in user_agent
+    is_linux = "Linux" in user_agent and "Android" not in user_agent
+    
+    if is_mac:
+        gpu_pool = [g for g in _WEBGL_RENDERERS if "Apple" in g["renderer"] or "Apple" in g["vendor"]]
+        screen_pool = [s for s in _SCREEN_RESOLUTIONS if s["dpr"] == 2]
+    elif is_linux:
+        gpu_pool = [g for g in _WEBGL_RENDERERS if "OpenGL 4.5" in g["renderer"]]
+        screen_pool = [s for s in _SCREEN_RESOLUTIONS if s["dpr"] <= 1]
+    else:
+        gpu_pool = [g for g in _WEBGL_RENDERERS if "Direct3D11" in g["renderer"]]
+        screen_pool = [s for s in _SCREEN_RESOLUTIONS if s["dpr"] <= 1.5]
+    
+    gpu = random.choice(gpu_pool) if gpu_pool else random.choice(_WEBGL_RENDERERS)
+    screen = random.choice(screen_pool) if screen_pool else random.choice(_SCREEN_RESOLUTIONS)
+    
+    # Platform string must match UA
+    if is_mac:
+        plat = "MacIntel"
+    elif is_linux:
+        plat = "Linux x86_64"
+    else:
+        plat = "Win32"
+    
+    # Generate fresh fingerprints per attempt (NO CACHING)
+    profile = {
+        # ━━━ Navigator ━━━
+        "user_agent": user_agent,
+        "platform": plat,
+        "hardware_concurrency": random.choice([4, 6, 8, 10, 12, 16]),
+        "device_memory": random.choice([4, 8, 16, 32]),
+        "language": "en-US",
+        "languages": ["en-US", "en"],
+        
+        # ━━━ User-Agent Data (Client Hints) ━━━
+        "client_hints": _get_client_hints(user_agent, plat),
+        
+        # ━━━ Canvas (Position-based deterministic noise) ━━━
+        "canvas_hash": _generate_canvas_noise(),
+        
+        # ━━━ WebGL (GPU vendor/renderer) ━━━
+        "webgl_vendor": gpu["vendor"],
+        "webgl_renderer": gpu["renderer"],
+        "webgl_hash": hashlib.md5(gpu["renderer"].encode()).hexdigest()[:16],
+        
+        # ━━━ AudioContext (Imperceptible noise ~-80dB) ━━━
+        "audio_noise": _generate_audio_noise(),
+        
+        # ━━━ Screen ━━━
+        "screen_width": screen["w"],
+        "screen_height": screen["h"],
+        "avail_width": screen["avail_w"],
+        "avail_height": screen["avail_h"],
+        "device_pixel_ratio": screen["dpr"],
+        "color_depth": 30 if is_mac else 24,
+        
+        # ━━━ Plugins/MimeTypes (PDF viewer consistency) ━━━
+        "pdf_viewer": _get_pdf_viewer_consistency(),
+    }
+    
+    # TANPA CACHING - setiap attempt menghasilkan fingerprint baru
+    return profile
 
 
 def get_stripe_cookies(fp: dict, real_cookies: dict = None) -> str:
@@ -412,10 +679,12 @@ async def warm_checkout_session(checkout_url: str, tls_profile: str, user_agent:
     return result
 
 
-async def send_m_stripe_beacon(fp: dict, checkout_url: str, tls_profile: str, user_agent: str, cookies_str: str, proxy: str = None) -> bool:
+async def send_m_stripe_beacon(fp: dict, checkout_url: str, tls_profile: str, user_agent: str, cookies_str: str, proxy: str = None, device_fp: dict = None) -> bool:
     """Send multiple telemetry beacons to m.stripe.com/6 like real Stripe.js.
     
     Real Stripe.js sends 5+ beacons throughout page lifecycle.
+    Args:
+        device_fp: Pre-generated device fingerprint for session consistency.
     """
     import json
     import time
@@ -431,9 +700,26 @@ async def send_m_stripe_beacon(fp: dict, checkout_url: str, tls_profile: str, us
         "cookie": cookies_str,
     }
     
+    # Add sec-ch-ua for Chrome-based browsers (must match UA)
+    browser = _detect_browser_info(user_agent)
+    if browser["browser"] in ("Chrome", "Edge", "Opera"):
+        v = browser["version"]
+        g_brand, g_ver = _get_grease_brand(v)
+        if browser["browser"] == "Edge":
+            beacon_headers["sec-ch-ua"] = f'"Chromium";v="{v}", "{g_brand}";v="{g_ver}", "Microsoft Edge";v="{v}"'
+        elif browser["browser"] == "Opera":
+            beacon_headers["sec-ch-ua"] = f'"Chromium";v="{v}", "{g_brand}";v="{g_ver}", "Opera";v="{v}"'
+        else:
+            beacon_headers["sec-ch-ua"] = f'"Chromium";v="{v}", "{g_brand}";v="{g_ver}", "Google Chrome";v="{v}"'
+        beacon_headers["sec-ch-ua-mobile"] = "?0"
+        beacon_headers["sec-ch-ua-platform"] = f'"{browser["platform"]}"'
+    
     now = int(time.time() * 1000)
     
-    # Multiple beacons matching real Stripe.js lifecycle
+    # Use provided device_fp for session consistency, or generate new one
+    if device_fp is None:
+        device_fp = generate_device_fingerprint(user_agent)
+    
     beacons = [
         {
             "v": 2,
@@ -447,6 +733,15 @@ async def send_m_stripe_beacon(fp: dict, checkout_url: str, tls_profile: str, us
                 "pageloadTimestamp": now,
                 "livemode": True,
                 "userAgent": user_agent,
+                "screenWidth": device_fp["screen_width"],
+                "screenHeight": device_fp["screen_height"],
+                "devicePixelRatio": device_fp["device_pixel_ratio"],
+                "colorDepth": device_fp["color_depth"],
+                "platform": device_fp["platform"],
+                "languages": device_fp["languages"],
+                "hardwareConcurrency": device_fp["hardware_concurrency"],
+                "deviceMemory": device_fp["device_memory"],
+                "clientHints": device_fp.get("client_hints", {}),
             }
         },
         {
@@ -504,6 +799,45 @@ async def send_m_stripe_beacon(fp: dict, checkout_url: str, tls_profile: str, us
                 "fieldType": "cardNumber",
             }
         },
+        # Device fingerprint beacon — Canvas/WebGL/AudioContext/Screen data
+        {
+            "v": 2,
+            "tag": "device_data",
+            "src": "checkout-js",
+            "pid": fp["guid"],
+            "data": {
+                "url": checkout_url,
+                "muid": fp["muid"],
+                "sid": fp["sid"],
+                # Canvas (Position-based noise)
+                "canvasHash": device_fp["canvas_hash"],
+                # WebGL (GPU vendor/renderer)
+                "webglHash": device_fp["webgl_hash"],
+                "webglVendor": device_fp["webgl_vendor"],
+                "webglRenderer": device_fp["webgl_renderer"],
+                # Screen (Resolution, colorDepth, pixelRatio)
+                "screenWidth": device_fp["screen_width"],
+                "screenHeight": device_fp["screen_height"],
+                "availWidth": device_fp["avail_width"],
+                "availHeight": device_fp["avail_height"],
+                "devicePixelRatio": device_fp["device_pixel_ratio"],
+                "colorDepth": device_fp["color_depth"],
+                # Navigator (Hardware Concurrency, Device Memory, Platform, Language)
+                "hardwareConcurrency": device_fp["hardware_concurrency"],
+                "deviceMemory": device_fp["device_memory"],
+                "platform": device_fp["platform"],
+                "language": device_fp["language"],
+                "languages": device_fp["languages"],
+                # User-Agent Data (Client Hints)
+                "clientHints": device_fp["client_hints"],
+                # AudioContext (Imperceptible noise ~-80dB)
+                "audioNoise": device_fp["audio_noise"],
+                # Plugins/MimeTypes (PDF viewer)
+                "pdfViewer": device_fp["pdf_viewer"],
+                "livemode": True,
+                "timestamp": now + random.randint(1000, 2000),
+            }
+        },
     ]
     
     sent = 0
@@ -549,38 +883,46 @@ async def send_m_stripe_beacon(fp: dict, checkout_url: str, tls_profile: str, us
         return False, {}
 
 
-def generate_session_context(user_id: int = None) -> dict:
+def generate_session_context(user_id: int = None, rotation_per_attempt: bool = True) -> dict:
     """Generate a complete session context for one checkout session.
     
-    This should be called ONCE per checkout session and reused for ALL
-    card attempts. Mimics a real user opening checkout in one browser.
+    Args:
+        user_id: User ID (kept for compatibility, tidak mempengaruhi fingerprint)
+        rotation_per_attempt: Jika True, setiap panggilan menghasilkan fingerprint baru
     
     Returns dict with:
-        - tls_profile: browser TLS profile (same browser for all cards)
-        - fingerprints: muid/guid/sid (same page load for all cards)
+        - tls_profile: browser TLS profile
+        - fingerprints: muid/guid/sid (fresh per attempt jika rotation=True)
         - cookies: stripe cookie header
         - payment_user_agent: stripe.js agent string
         - pasted_fields: which fields were pasted
-        - time_on_page_base: base time user spent on page (increases per card)
+        - time_on_page_base: base time user spent on page
+        - device_fp: Device fingerprint dengan metode terbatas (Navigator, Client Hints, 
+                     Canvas, WebGL, AudioContext, Screen, Plugins/MimeTypes)
     """
     # Pick ONE browser for the entire session — TLS + UA always matched
     browser = get_random_browser_profile()
     tls_profile = browser["tls"]
     user_agent = browser["ua"]
 
-    # Generate fingerprints ONCE (guid+sid stay same for all cards in session)
+    # Generate fingerprints - ROTATION PER ATTEMPT (tidak di-cache)
     fp = generate_stripe_fingerprints(user_id)
 
-    # Cookies stay same for session
+    # Cookies - fresh per attempt jika rotation enabled
     cookies = get_stripe_cookies(fp)
 
-    # Payment user agent stays same for session
+    # Payment user agent - fresh per attempt
     payment_user_agent = get_random_stripe_js_agent()
 
-    # Randomize pasted_fields (some users type, some paste)
+    # Device fingerprint - FRESH PER ATTEMPT (rotasi, tidak ada caching)
+    # Menggunakan hanya metode: Navigator, Client Hints, Canvas, WebGL, 
+    # AudioContext, Screen, Plugins/MimeTypes
+    device_fp = generate_device_fingerprint(user_agent, user_id=None if rotation_per_attempt else user_id)
+
+    # Randomize pasted_fields
     pasted_fields = random.choice(["number", "number|cvc", "number|cvc|exp", ""])
 
-    # Base time on page — starts at 20-60s, will increase per card
+    # Base time on page
     time_on_page_base = random.randint(20000, 60000)
 
     return {
@@ -589,6 +931,9 @@ def generate_session_context(user_id: int = None) -> dict:
         "fingerprints": fp,
         "cookies": cookies,
         "payment_user_agent": payment_user_agent,
+        "device_fp": device_fp,
         "pasted_fields": pasted_fields,
         "time_on_page_base": time_on_page_base,
+        "allow_redisplay": "unspecified",
+        "rotation_enabled": rotation_per_attempt,  # Flag untuk tracking
     }

